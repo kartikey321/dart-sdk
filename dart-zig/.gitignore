@@ -1,0 +1,8 @@
+.zig-cache/
+.zig-global-cache/
+.zig-global-cache-linux/
+zig-out/
+zig-out-linux/
+test-snapshots/*.dill
+test-snapshots/*.dylib
+test-snapshots/*.so

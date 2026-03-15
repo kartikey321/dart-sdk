@@ -76,5 +76,9 @@ DART_EXPORT Dart_Handle DartEngine_DrainMicrotasksQueue() {
   return Engine::instance()->DrainMicrotasksQueue();
 }
 
+DART_EXPORT void DartEngine_SetHooks(DartZigIoHooks hooks) {
+  Engine::instance()->SetHooks(hooks);
+}
+
 }  // namespace engine
 }  // namespace dart

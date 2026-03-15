@@ -193,4 +193,12 @@ DART_EXPORT DartEngine_SnapshotData DartEngine_KernelFromFile(const char* path,
 DART_EXPORT DartEngine_SnapshotData
 DartEngine_AotSnapshotFromFile(const char* path, char** error);
 
+typedef struct DartZigIoHooks {
+  Dart_Handle (*setup_core_libs)(Dart_Isolate isolate, void* context);
+  Dart_Handle (*register_io_natives)(Dart_Handle library, void* context);
+  void* context;
+} DartZigIoHooks;
+
+DART_EXPORT void DartEngine_SetHooks(DartZigIoHooks hooks);
+
 #endif  // RUNTIME_ENGINE_INCLUDE_DART_ENGINE_H_

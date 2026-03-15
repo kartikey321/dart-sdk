@@ -60,6 +60,8 @@ class Engine {
   // The caller should continue to drain the queue after handling the error.
   Dart_Handle DrainMicrotasksQueue();
 
+  void SetHooks(DartZigIoHooks hooks);
+
   // Sets a callback to be called when Dart_HandleMessage returns an error.
   void SetHandleMessageErrorCallback(
       DartEngine_HandleMessageErrorCallback callback);
@@ -89,6 +91,16 @@ class Engine {
   static void MessageNotifyCallback(Dart_Isolate isolate);
   // Passed to user-previded message scheduler callback.
   static void HandleMessageCallback(Dart_Isolate isolate);
+  static Dart_Isolate CreateGroupCallback(
+      const char* script_uri,
+      const char* main,
+      const char* package_root,
+      const char* package_config,
+      Dart_IsolateFlags* flags,
+      void* isolate_data,
+      char** error);
+  static bool InitializeIsolateCallback(void** child_isolate_data,
+                                        char** error);
 
  private:
   // Engine's internal data for isolate.
@@ -136,6 +148,8 @@ class Engine {
 
   // Callback to notify about Dart_HandleMessage errors.
   DartEngine_HandleMessageErrorCallback handle_message_error_callback_;
+
+  DartZigIoHooks hooks_ = {nullptr, nullptr, nullptr};
 
   // Helper function to get an element from isolate_data_.
   std::shared_ptr<IsolateData> DataForIsolate(Dart_Isolate isolate);

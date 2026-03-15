@@ -99,8 +99,9 @@ Dart_InitializeParams CreateInitializeParams() {
   Dart_InitializeParams params;
   memset(&params, 0, sizeof(params));
   params.version = DART_INITIALIZE_PARAMS_CURRENT_VERSION;
+  params.create_group = Engine::CreateGroupCallback;
+  params.initialize_isolate = Engine::InitializeIsolateCallback;
   params.shutdown_isolate = nullptr;
-  params.create_group = nullptr;
   return params;
 }
 }  // namespace
@@ -194,9 +195,14 @@ Dart_Isolate Engine::StartIsolate(DartEngine_SnapshotData snapshot,
 
   // In fact, this call initializes core libraries, (e.g. `print` doesn't work
   // without it).
-  Dart_Handle core_libs_result = bin::DartUtils::SetupCoreLibraries(
-      /*is_service_isolate=*/false, /*trace_loading=*/false,
-      /*flag_profile_microtasks=*/false, bin::DartIoSettings{});
+  Dart_Handle core_libs_result;
+  if (hooks_.setup_core_libs != nullptr) {
+    core_libs_result = hooks_.setup_core_libs(isolate, hooks_.context);
+  } else {
+    core_libs_result = bin::DartUtils::SetupCoreLibraries(
+        /*is_service_isolate=*/false, /*trace_loading=*/false,
+        /*flag_profile_microtasks=*/false, bin::DartIoSettings{});
+  }
   if (Dart_IsError(core_libs_result)) {
     *error = Utils::StrDup(Dart_GetError(core_libs_result));
     Dart_ShutdownIsolate();
@@ -259,6 +265,13 @@ void Engine::Shutdown() {
     Dart_ShutdownIsolate();
     UnlockIsolate(isolate);
   }
+
+  char* cleanup_error = Dart_Cleanup();
+  if (cleanup_error != nullptr) {
+    Syslog::PrintErr("Dart_Cleanup error: %s\n", cleanup_error);
+    free(cleanup_error);
+  }
+  dart::embedder::Cleanup();
 
   MutexLocker state_locker(&engine_state_);
   for (auto& snapshot : owned_snapshots_) {
@@ -372,6 +385,45 @@ void Engine::SetDefaultMessageScheduler(DartEngine_MessageScheduler scheduler) {
 void Engine::SetMessageScheduler(DartEngine_MessageScheduler scheduler,
                                  Dart_Isolate isolate) {
   DataForIsolate(isolate)->scheduler = scheduler;
+}
+
+void Engine::SetHooks(DartZigIoHooks hooks) {
+  hooks_ = hooks;
+}
+
+Dart_Isolate Engine::CreateGroupCallback(
+    const char* script_uri,
+    const char* main,
+    const char* package_root,
+    const char* package_config,
+    Dart_IsolateFlags* flags,
+    void* isolate_data,
+    char** error) {
+  Engine* engine = Engine::instance();
+  DartEngine_SnapshotData matching_snapshot;
+  bool found_snapshot = false;
+  {
+    MutexLocker ml(&engine->engine_state_);
+    for (const auto& snapshot : engine->owned_snapshots_) {
+      if (snapshot.script_uri != nullptr && script_uri != nullptr &&
+          strcmp(snapshot.script_uri, script_uri) == 0) {
+        matching_snapshot = snapshot;
+        found_snapshot = true;
+        break;
+      }
+    }
+  }
+
+  if (!found_snapshot) {
+    *error = Utils::StrDup("dart-zig: no snapshot registered for script_uri");
+    return nullptr;
+  }
+  return engine->StartIsolate(matching_snapshot, error);
+}
+
+bool Engine::InitializeIsolateCallback(void** child_isolate_data,
+                                       char** error) {
+  return true;
 }
 
 }  // namespace engine

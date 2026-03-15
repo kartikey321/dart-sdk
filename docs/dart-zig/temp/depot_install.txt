@@ -1,0 +1,202 @@
+e` for that path.
+
+To optimize read times, this resolved state is **pre-computed and natively flattened** into the employee's Firestore document (under `centralAccess` or the project's `access` array). Validating permissions at runtime requires no complex join logic; it is simply a direct traversal of the pre-computed tree.
+
+### 3. Deny-By-Default Paradigm
+
+Permission verification algorithms should execute as follows:
+
+1. Target the correct payload context: Company-level vs Project-level.
+2. Traverse the pre-computed tree: `Module(moduleKey) -> SubModule(subModuleKey) -> AccessValue(accessKey)`.
+3. If the path leads to a boolean `value`, return that `value`.
+4. If the path is broken, does not exist, or the key is absent, immediately return **`false`**.
+
+This strict **deny-by-default** stance ensures maximum security.
+
+
+kartik@MacBook-Pro-2 ~ % 
+kartik@MacBook-Pro-2 ~ % clear
+
+kartik@MacBook-Pro-2 ~ % cd ~
+kartik@MacBook-Pro-2 ~ %   git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+Cloning into 'depot_tools'...
+remote: Finding sources: 100% (17/17)
+remote: Total 67816 (delta 43714), reused 67809 (delta 43714)
+Receiving objects: 100% (67816/67816), 72.62 MiB | 8.27 MiB/s, done.
+Resolving deltas: 100% (43714/43714), done.
+kartik@MacBook-Pro-2 ~ %   echo 'export PATH="$HOME/depot_tools:$PATH"' >> ~/.zshrc
+kartik@MacBook-Pro-2 ~ %   source ~/.zshrc
+kartik@MacBook-Pro-2 ~ %   which gclient  # should now find it
+/Users/kartik/depot_tools/gclient
+# not found
+should not found
+now not found
+/usr/bin/find
+it not found
+kartik@MacBook-Pro-2 ~ %   which gclient                      
+/Users/kartik/depot_tools/gclient
+kartik@MacBook-Pro-2 ~ % cd /Users/kartik/StudioProjects/dart-sdk
+kartik@MacBook-Pro-2 dart-sdk % gclient sync 
+WARNING: Your metrics.cfg file was invalid or nonexistent. A new one will be created.
+Error: client not configured; see 'gclient config'
+kartik@MacBook-Pro-2 dart-sdk % gclient config
+Usage: gclient.py config [options] [url]
+
+gclient.py: error: Inconsistent arguments. Use either --spec or one or 2 args
+kartik@MacBook-Pro-2 dart-sdk % cd /Users/kartik/StudioProjects
+kartik@MacBook-Pro-2 StudioProjects % gclient sync
+
+55>WARNING: subprocess '"git" "-c" "core.deltaBaseCacheLimit=2g" "clone" "--no-checkout" "--progress" "https://chromium.googlesource.com/chromium/src/third_party/ply.git" "/Users/kartik/StudioProjects/sdk/third_party/_gclient_ply_285mtcfn"' in /Users/kartik/StudioProjects failed; will retry after a short nap...
+55>WARNING: subprocess '"git" "-c" "core.deltaBaseCacheLimit=2g" "clone" "--no-checkout" "--progress" "https://chromium.googlesource.com/chromium/src/third_party/ply.git" "/Users/kartik/StudioProjects/sdk/third_party/_gclient_ply_285mtcfn"' in /Users/kartik/StudioProjects failed; will retry after a short nap...
+40>WARNING: subprocess '"git" "-c" "core.deltaBaseCacheLimit=2g" "fetch" "origin" "--no-tags"' in /Users/kartik/StudioProjects/sdk/third_party/pkg/i18n failed; will retry after a short nap...
+Syncing projects:  98% (56/57) sdk/third_party/perfetto/src               
+[0:03:00] Still working on:
+[0:03:00]   sdk/third_party/icu
+
+[0:03:10] Still working on:
+[0:03:10]   sdk/third_party/icu
+
+[0:03:20] Still working on:
+[0:03:20]   sdk/third_party/icu
+
+[0:03:30] Still working on:
+[0:03:30]   sdk/third_party/icu
+
+[0:03:40] Still working on:
+[0:03:40]   sdk/third_party/icu
+
+[0:03:50] Still working on:
+[0:03:50]   sdk/third_party/icu
+Syncing projects: 100% (57/57) sdk/third_party/icu         
+sdk/third_party/ply (ERROR)
+----------------------------------------
+[0:00:58] Started.
+[0:00:58] 
+
+________ running 'git -c core.deltaBaseCacheLimit=2g clone --no-checkout --progress https://chromium.googlesource.com/chromium/src/third_party/ply.git /Users/kartik/StudioProjects/sdk/third_party/_gclient_ply_285mtcfn' in '/Users/kartik/StudioProjects'
+
+[0:00:58] Cloning into '/Users/kartik/StudioProjects/sdk/third_party/_gclient_ply_285mtcfn'...
+[0:00:59] error: RPC failed; HTTP 429 curl 22 The requested URL returned error: 429
+[0:00:59] fatal: expected flush after ref listing
+[0:01:01] 
+________ running 'git -c core.deltaBaseCacheLimit=2g clone --no-checkout --progress https://chromium.googlesource.com/chromium/src/third_party/ply.git /Users/kartik/StudioProjects/sdk/third_party/_gclient_ply_285mtcfn' in '/Users/kartik/StudioProjects' attempt 2 / 2
+
+[0:01:01] Cloning into '/Users/kartik/StudioProjects/sdk/third_party/_gclient_ply_285mtcfn'...
+[0:01:01] remote: RESOURCE_EXHAUSTED: Resource has been exhausted (e.g. check quota)
+[0:01:01] remote: [type.googleapis.com/google.rpc.QuotaFailure]
+[0:01:01] remote: violations {
+[0:01:01] remote:   subject: "ip/103.106.29.162"
+[0:01:01] remote:   description: "Short term server-time rate limit exceeded"
+[0:01:01] remote: }
+[0:01:01] remote: 
+[0:01:01] remote: [type.googleapis.com/google.rpc.RequestInfo]
+[0:01:01] remote: request_id: "39f3aaaef3e14c49a3875e5a6d3ae048"
+[0:01:01] fatal: unable to access 'https://chromium.googlesource.com/chromium/src/third_party/ply.git/': The requested URL returned error: 429
+Traceback (most recent call last):
+  File "/Users/kartik/depot_tools/gclient_scm.py", line 1415, in _Clone
+    self._Run(clone_cmd,
+  File "/Users/kartik/depot_tools/gclient_scm.py", line 1762, in _Run
+    gclient_utils.CheckCallAndFilter(cmd, env=env, **kwargs)
+  File "/Users/kartik/depot_tools/gclient_utils.py", line 733, in CheckCallAndFilter
+    raise subprocess2.CalledProcessError(rv, args, kwargs.get('cwd', None),
+subprocess2.CalledProcessError: Command 'git -c core.deltaBaseCacheLimit=2g clone --no-checkout --progress https://chromium.googlesource.com/chromium/src/third_party/ply.git /Users/kartik/StudioProjects/sdk/third_party/_gclient_ply_285mtcfn' returned non-zero exit status 128 in /Users/kartik/StudioProjects
+[0:01:06] _____ Conflicting directory found in /Users/kartik/StudioProjects/sdk/third_party/ply. Moving to /Users/kartik/StudioProjects/_bad_scm/sdk/third_party/ply_wwskppz.
+----------------------------------------
+
+
+Warnings:
+Conflicting directory /Users/kartik/StudioProjects/sdk/third_party/ply moved to /Users/kartik/StudioProjects/_bad_scm/sdk/third_party/ply_wwskppz.
+Traceback (most recent call last):
+  File "/Users/kartik/depot_tools/gclient_scm.py", line 840, in update
+    self.current_revision = self._Clone(revision, url, options)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/kartik/depot_tools/gclient_scm.py", line 1415, in _Clone
+    self._Run(clone_cmd,
+  File "/Users/kartik/depot_tools/gclient_scm.py", line 1762, in _Run
+    gclient_utils.CheckCallAndFilter(cmd, env=env, **kwargs)
+  File "/Users/kartik/depot_tools/gclient_utils.py", line 733, in CheckCallAndFilter
+    raise subprocess2.CalledProcessError(rv, args, kwargs.get('cwd', None),
+subprocess2.CalledProcessError: Command 'git -c core.deltaBaseCacheLimit=2g clone --no-checkout --progress https://chromium.googlesource.com/chromium/src/third_party/ply.git /Users/kartik/StudioProjects/sdk/third_party/_gclient_ply_285mtcfn' returned non-zero exit status 128 in /Users/kartik/StudioProjects
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/kartik/Library/Caches/vpython-root.501/store/cpython+b1ggcnevh3ekhef6bb2fgqn9eg/contents/lib/python3.11/shutil.py", line 853, in move
+    os.rename(src, real_dst)
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/kartik/StudioProjects/sdk/third_party/ply' -> '/Users/kartik/StudioProjects/_bad_scm/sdk/third_party/ply_wwskppz/ply'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/kartik/depot_tools/metrics.py", line 308, in print_notice_and_exit
+    yield
+  File "/Users/kartik/depot_tools/gclient.py", line 4733, in <module>
+    sys.exit(main(sys.argv[1:]))
+             ^^^^^^^^^^^^^^^^^^
+  File "/Users/kartik/depot_tools/gclient.py", line 4719, in main
+    return dispatcher.execute(OptionParser(), argv)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/kartik/depot_tools/subcommand.py", line 262, in execute
+    return command(parser, args[1:])
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/kartik/depot_tools/gclient.py", line 4055, in CMDsync
+    ret = client.RunOnDeps('update', args)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/kartik/depot_tools/gclient.py", line 2465, in RunOnDeps
+    work_queue.flush(revision_overrides,
+  File "/Users/kartik/depot_tools/gclient_utils.py", line 1045, in flush
+    reraise(e[0], e[1], e[2])
+  File "/Users/kartik/depot_tools/gclient_utils.py", line 54, in reraise
+    raise value
+  File "/Users/kartik/depot_tools/gclient_utils.py", line 1124, in run
+    self.item.run(*self.args, **self.kwargs)
+  File "/Users/kartik/depot_tools/gclient.py", line 1252, in run
+    self._got_revision = self._used_scm.RunCommand(
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/kartik/depot_tools/gclient_scm.py", line 136, in RunCommand
+    return getattr(self, command)(options, args, file_list)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/kartik/depot_tools/gclient_scm.py", line 672, in wrapper
+    return_val = f(*args)
+                 ^^^^^^^^
+  File "/Users/kartik/depot_tools/gclient_scm.py", line 843, in update
+    self._DeleteOrMove(options.force)
+  File "/Users/kartik/depot_tools/gclient_scm.py", line 208, in _DeleteOrMove
+    shutil.move(self.checkout_path, dest_path)
+  File "/Users/kartik/Library/Caches/vpython-root.501/store/cpython+b1ggcnevh3ekhef6bb2fgqn9eg/contents/lib/python3.11/shutil.py", line 873, in move
+    copy_function(src, real_dst)
+  File "/Users/kartik/Library/Caches/vpython-root.501/store/cpython+b1ggcnevh3ekhef6bb2fgqn9eg/contents/lib/python3.11/shutil.py", line 448, in copy2
+    copyfile(src, dst, follow_symlinks=follow_symlinks)
+  File "/Users/kartik/Library/Caches/vpython-root.501/store/cpython+b1ggcnevh3ekhef6bb2fgqn9eg/contents/lib/python3.11/shutil.py", line 256, in copyfile
+    with open(src, 'rb') as fsrc:
+         ^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/kartik/StudioProjects/sdk/third_party/ply'
+
+kartik@MacBook-Pro-2 StudioProjects % gclient sync
+
+
+________ running 'git -c core.deltaBaseCacheLimit=2g clone --no-checkout --progress https://dart.googlesource.com/sdk.git /Users/kartik/StudioProjects/_gclient_sdk_4kupj1tw' in '/Users/kartik/StudioProjects'
+Cloning into '/Users/kartik/StudioProjects/_gclient_sdk_4kupj1tw'...
+remote: Finding sources: 100% (211/211)
+remote: Total 1778951 (delta 1410339), reused 1778899 (delta 1410339)
+Receiving objects: 100% (1778951/1778951), 1.44 GiB | 10.64 MiB/s, done.
+Resolving deltas: 100% (1410339/1410339), done.
+Syncing projects: 100% (57/57), done.                                           
+Running hooks: 100% (9/9), done.                           
+
+
+Warnings:
+git update is recommended.
+Installed git version is 2.39.5;
+depot_tools recommends version 2.46.0 or later.
+Disable this warning by setting the GCLIENT_SUPPRESS_GIT_VERSION_WARNING
+environment variable to 1.
+kartik@MacBook-Pro-2 StudioProjects % cd /Users/kartik/StudioProjects/sdk
+./tools/build.py --mode=release
+Generating Xcode projects took 22ms
+Done. Made 656 targets from 137 files in 3463ms
+buildtools/ninja/ninja -C xcodebuild/ReleaseARM64
+ninja: Entering directory `xcodebuild/ReleaseARM64'
+[4915/4915] ACTION //utils/dartdev:dar...shot(//build/toolchain/mac:clang_arm64
+The build took 479.582 seconds
+kartik@MacBook-Pro-2 sdk % 
