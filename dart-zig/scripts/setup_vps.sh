@@ -60,15 +60,16 @@ if [[ -f "$JIT_SO" && -f "$AOT_SO" ]]; then
 else
     echo "[engine] Building Dart engine (JIT + AOT) — this takes 20-40 min..."
 
-    # depot_tools
-    if ! command -v gclient &>/dev/null; then
+    # depot_tools — add to PATH if already cloned, clone if missing
+    if [[ -d "$HOME/depot_tools" ]]; then
+        export PATH="$HOME/depot_tools:${PATH:-}"
+    elif ! command -v gclient &>/dev/null; then
         echo "[engine] Installing depot_tools..."
         git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git \
             "$HOME/depot_tools"
-        export PATH="$HOME/depot_tools:$PATH"
+        export PATH="$HOME/depot_tools:${PATH:-}"
         echo "export PATH=\"$HOME/depot_tools:\$PATH\"" >> ~/.bashrc
     fi
-    export PATH="$HOME/depot_tools:${PATH:-}"
 
     # gclient sync (only if out/ReleaseX64 doesn't exist)
     cd "$SDK/.."
