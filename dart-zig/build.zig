@@ -9,11 +9,13 @@ pub fn build(b: *std.Build) void {
     // -Daot=false (default) → link dart_engine_jit_shared (runs .dill kernel snapshots).
     const aot = b.option(bool, "aot", "Link the AOT engine (dart_engine_aot_shared) instead of JIT") orelse false;
 
-    // Platform-specific engine output directory (based on build host)
-    const engine_dir = if (builtin.os.tag == .linux)
-        "../out/ReleaseARM64"
-    else
-        "../xcodebuild/ReleaseARM64";
+    // Allow explicit override: -Dengine-dir=../out/ReleaseX64
+    // Default: auto-detect from OS + CPU arch.
+    const engine_dir = b.option([]const u8, "engine-dir", "Path to the Dart engine output directory") orelse
+        if (builtin.os.tag == .linux)
+            if (builtin.cpu.arch == .aarch64) "../out/ReleaseARM64" else "../out/ReleaseX64"
+        else
+            "../xcodebuild/ReleaseARM64";
 
     const exe = b.addExecutable(.{
         .name = if (aot) "dart-zig-aot" else "dart-zig",
