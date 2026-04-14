@@ -31,6 +31,13 @@ pub fn build(b: *std.Build) void {
     const engine_lib = if (aot) "dart_engine_aot_shared" else "dart_engine_jit_shared";
     exe.root_module.linkSystemLibrary(engine_lib, .{});
 
+    // Phase 15: BoringSSL TLS — link libssl + libcrypto (built via scripts/build_boringssl.sh).
+    exe.root_module.addIncludePath(b.path("../third_party/boringssl/src/include"));
+    exe.root_module.addLibraryPath(b.path("boringssl-build"));
+    exe.root_module.linkSystemLibrary("ssl", .{});
+    exe.root_module.linkSystemLibrary("crypto", .{});
+    exe.linkLibCpp(); // BoringSSL is C++ internally
+
     if (builtin.os.tag == .linux) {
         // pthread_create is a weak symbol in glibc — must explicitly link pthreads
         // so libdart_engine_jit_shared.so sees a non-null pthread_create at startup.

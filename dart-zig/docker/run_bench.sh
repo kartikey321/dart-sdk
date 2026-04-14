@@ -18,6 +18,12 @@ echo "=== Rebuilding dart-zig (Linux / io_uring) ==="
 cd $DART_ZIG && ZIG_GLOBAL_CACHE_DIR=.zig-global-cache-linux zig build 2>&1
 BIN=$DART_ZIG/zig-out/bin/dart-zig
 echo "Built: $BIN"
+
+# Persist the freshly-built Linux binary to zig-out-linux/bin/ on the volume
+# so callers outside Docker (e.g. CI) can reference it without re-running Docker.
+mkdir -p $DART_ZIG/zig-out-linux/bin
+cp $BIN $DART_ZIG/zig-out-linux/bin/dart-zig
+echo "Copied to: $DART_ZIG/zig-out-linux/bin/dart-zig"
 echo ""
 
 export LD_LIBRARY_PATH=$ENGINE_LIB

@@ -37,26 +37,37 @@ Future<int> _accept(int listenFd) {
 class _ZigConn {
   final int fd;
   final RawReceivePort _port;
-  Completer<Object?>? _pending;
+  Completer<Uint8List?>? _pendingRead;
+  Completer<int>? _pendingWrite;
 
   _ZigConn(this.fd) : _port = RawReceivePort() {
     _port.handler = (Object? msg) {
-      final c = _pending!;
-      _pending = null;
-      c.complete(msg);
+      final read = _pendingRead;
+      if (read != null) {
+        _pendingRead = null;
+        read.complete(msg as Uint8List?);
+        return;
+      }
+      final write = _pendingWrite;
+      if (write != null) {
+        _pendingWrite = null;
+        write.complete((msg as int?) ?? -1);
+      }
     };
   }
 
   Future<Uint8List?> read(int maxBytes) {
-    _pending = Completer<Object?>();
+    final c = Completer<Uint8List?>();
+    _pendingRead = c;
     zigIoTcpRead(fd, maxBytes, _port.sendPort);
-    return _pending!.future.then((v) => v as Uint8List?);
+    return c.future;
   }
 
   Future<int> writeBytes(Uint8List bytes) {
-    _pending = Completer<Object?>();
+    final c = Completer<int>();
+    _pendingWrite = c;
     zigIoTcpWriteBytes(fd, bytes, _port.sendPort);
-    return _pending!.future.then((v) => (v as int?) ?? -1);
+    return c.future;
   }
 
   void close() {

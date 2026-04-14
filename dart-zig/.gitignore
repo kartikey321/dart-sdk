@@ -6,3 +6,5 @@ zig-out-linux/
 test-snapshots/*.dill
 test-snapshots/*.dylib
 test-snapshots/*.so
+boringssl-build/
+test-certs/

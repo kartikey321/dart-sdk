@@ -41,7 +41,7 @@ Dart application code
    Kernel (kevent / io_uring_enter)  ◄───────────────────┘
 ```
 
-- **CompletionCtx pool**: 256 slots × ~8 KB each (2 MB heap). Each in-flight accept/recv/send occupies one slot. O(1) free-list allocator (`SlotAllocator`).
+- **CompletionCtx pool**: 4096 slots × ~8 KB each (32 MB heap). Each in-flight accept/recv/send occupies one slot. O(1) free-list allocator (`SlotAllocator`).
 - **Inline write fast-path**: `submitSend` tries `posix.write()` inline before queuing a SQE/kevent. On loopback the TCP send buffer is never full — eliminates a full kernel round-trip per echo.
 - **AOT support**: `dart-zig-aot` binary links `dart_engine_aot_shared`. Pass `.dylib` (macOS) or `.so` (Linux) snapshot; runtime auto-detects by extension.
 
@@ -239,11 +239,26 @@ dart-zig/
 │   │   ├── common.zig           # Platform dispatch
 │   │   ├── kqueue.zig           # macOS backend
 │   │   └── io_uring.zig         # Linux backend
-│   └── zig_io/
-│       ├── state.zig            # CompletionCtx pool, SlotAllocator, LoopOps vtable
-│       └── natives/
-│           ├── tcp.zig          # Native entry points (accept/recv/send/close)
-│           └── resolver.zig     # Dart native function resolver
+│   ├── zig_io/
+│   │   ├── state.zig            # CompletionCtx pool, SlotAllocator, LoopOps vtable
+│   │   ├── resolver.zig         # ZigIo native function resolver
+│   │   ├── native_table.zig     # ZigIo native lookup table
+│   │   └── natives/
+│   │       ├── tcp.zig          # Native entry points (accept/recv/send/close, token API)
+│   │       ├── write.zig        # ZigIo_StdoutWrite
+│   │       └── version.zig      # ZigIo_Version
+│   └── http/
+│       ├── parser.zig           # Zero-allocation HTTP/1.1 state machine (with tests)
+│       ├── natives.zig          # ZigHttp_Parse synchronous native
+│       ├── native_table.zig     # ZigHttp native lookup table
+│       └── resolver.zig         # ZigHttp native function resolver
+├── lib/
+│   ├── zig_io.dart              # Dart-side native bindings + batch dispatcher
+│   ├── zig_http.dart            # HttpRequest + parseHttpRequest (ZigHttp_Parse)
+│   ├── echo_server.dart         # dart-zig echo server (benchmark target)
+│   ├── dart_io_echo.dart        # dart:io echo server (baseline)
+│   ├── http_server.dart         # HTTP/1.1 Hello World server (wrk target)
+│   └── bench_echo_concurrent.dart
 ├── test-snapshots/              # Compiled .dill and .dylib/.so snapshots
 ├── docker/
 │   ├── Dockerfile
@@ -265,6 +280,14 @@ dart-zig/
 | 10a   | ~200k             | ~180k            | —            | —           |
 | 10c   | ~270k             | ~240k            | —            | —           |
 | **11**| **274k**          | **253k**         | **291k avg** | **283k avg**|
+| 12    | _(client-limited)_| —                | ~350k        | —           |
+| 13    | —                 | —                | 133–147k HTTP| —           |
+| 14    | —                 | —                | 159k HTTP    | —           |
+
+> **Notes:**
+> - Phase 12+ numbers use `kPoolSize=4096` (32 MB pool).
+> - Phase 12 echo numbers plateau at ~350k because the benchmark client (single Dart event loop) saturates first. A multi-threaded client (wrk, bombardier) is needed to show N× scaling.
+> - Phase 13–14 HTTP numbers from `wrk -t4 -c128 -d10s` on the same machine as the server; client/server compete for cores.
 
 ---
 

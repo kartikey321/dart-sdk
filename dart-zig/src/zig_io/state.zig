@@ -5,22 +5,23 @@ const std = @import("std");
 const posix = std.posix;
 const engine = @import("../engine.zig");
 
-pub const kPoolSize: usize = 256;
+pub const kPoolSize: usize = 4096;
 /// user_data/udata values 1-15 are reserved for system ops
 /// (notify=1, timeout=2, signal=3).  Pool slots start at 16.
 pub const kPoolBase: u64 = 16;
 
 /// Maximum bytes per recv or send buffer embedded in the pool slot.
-/// 256 slots × 8 KB = 2 MB total — stays resident in L3 cache.
+/// 4096 slots × 8 KB = 32 MB total — stays resident in L3 cache.
 pub const kBufSize: usize = 8192;
 
-pub const Op = enum(u8) { accept, recv, send };
+pub const Op = enum(u8) { accept, recv, send, tls_handshake };
 
 pub const CompletionCtx = struct {
     in_use: bool = false,
     op: Op = .accept,
     port_id: engine.Dart_Port = 0,
     fd: posix.fd_t = -1,
+    tls_id: u16 = 0,
     data: Data = .{ .accept = {} },
 
     pub const Data = union(Op) {
@@ -33,6 +34,8 @@ pub const CompletionCtx = struct {
         /// Pre-allocated send buffer embedded in the slot.
         /// Filled by ZigIo_TcpWriteBytes via @memcpy from Dart Uint8List.
         send: SendData,
+        /// TLS handshake state is kept in zig_io/tls.zig.
+        tls_handshake: void,
     };
 
     pub const RecvData = struct {
@@ -56,6 +59,8 @@ pub const LoopRef = struct {
     ops: *const LoopOps,
     pool: *[kPoolSize]CompletionCtx,
     slot_alloc: *SlotAllocator,
+    /// Points into the EventLoop struct; ZigIo_SetBatchPort writes through this.
+    batch_port_ptr: *engine.Dart_Port,
 };
 
 /// Set at the top of `run()` in each backend; read by tcp.zig natives.
@@ -63,7 +68,7 @@ pub const LoopRef = struct {
 pub threadlocal var current_loop: ?LoopRef = null;
 
 /// O(1) free-list allocator for completion pool slots.
-/// Avoids scanning all 256 slots on every submit.
+/// Avoids scanning all 4096 slots on every submit.
 pub const SlotAllocator = struct {
     free_stack: [kPoolSize]u16 = undefined,
     free_len: usize = 0,

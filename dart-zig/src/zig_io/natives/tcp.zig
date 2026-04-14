@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const engine = @import("../../engine.zig");
 const state = @import("../state.zig");
+const profiler = @import("../../profiler.zig");
 
 /// ZigIo_TcpBind(host: String, port: int, backlog: int) → int (fd or -errno)
 /// Synchronous: creates, binds, and listens a TCP socket. Returns fd on success.
@@ -41,15 +42,191 @@ fn tcpBind(host: []const u8, port: u16, backlog: u31) !i64 {
     errdefer posix.close(sock);
 
     try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    // SO_REUSEPORT: allows N workers to each bind their own socket to the same
+    // port. The kernel distributes incoming connections across all listeners
+    // with zero cross-thread coordination (Phase 12 multicore).
+    try posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
     try posix.bind(sock, &addr.any, addr.getOsSockLen());
     try posix.listen(sock, backlog);
 
     return sock;
 }
 
+// ---------------------------------------------------------------------------
+// Token completion helpers
+//
+// These post a 2-element kArray [token, value] to the batch port so the Dart
+// _ZigIoDispatcher._onBatch handler can resolve the correct Completer.
+// They are used on error / fast-path exits where no pool slot is submitted,
+// guaranteeing that every token submission produces exactly one completion.
+// No-ops if the batch port has not yet been initialised (batch_port_ptr == 0),
+// which can only happen if ZigIo_SetBatchPort has not been called — a
+// programming error that is not reachable during normal operation.
+// ---------------------------------------------------------------------------
+
+/// Post [token, int_val] to the batch port.
+fn postTokenInt(loop: state.LoopRef, token: i64, int_val: i64) void {
+    if (loop.batch_port_ptr.* == 0) return;
+    var token_obj = engine.Dart_CObject{
+        .@"type" = engine.Dart_CObject_kInt64,
+        .value = .{ .as_int64 = token },
+    };
+    var value_obj = engine.Dart_CObject{
+        .@"type" = engine.Dart_CObject_kInt64,
+        .value = .{ .as_int64 = int_val },
+    };
+    var ptrs = [2]?*engine.Dart_CObject{ &token_obj, &value_obj };
+    var obj = engine.Dart_CObject{
+        .@"type" = engine.Dart_CObject_kArray,
+        .value = .{ .as_array = .{ .length = 2, .values = ptrs[0..].ptr } },
+    };
+    _ = engine.Dart_PostCObject(loop.batch_port_ptr.*, &obj);
+}
+
+/// Post [token, null] to the batch port (EOF / recv error sentinel).
+fn postTokenNull(loop: state.LoopRef, token: i64) void {
+    if (loop.batch_port_ptr.* == 0) return;
+    var token_obj = engine.Dart_CObject{
+        .@"type" = engine.Dart_CObject_kInt64,
+        .value = .{ .as_int64 = token },
+    };
+    var null_obj = engine.Dart_CObject{
+        .@"type" = engine.Dart_CObject_kNull,
+        .value = .{ .as_int64 = 0 },
+    };
+    var ptrs = [2]?*engine.Dart_CObject{ &token_obj, &null_obj };
+    var obj = engine.Dart_CObject{
+        .@"type" = engine.Dart_CObject_kArray,
+        .value = .{ .as_array = .{ .length = 2, .values = ptrs[0..].ptr } },
+    };
+    _ = engine.Dart_PostCObject(loop.batch_port_ptr.*, &obj);
+}
+
+/// ZigIo_SetBatchPort(port: SendPort) → void
+/// Called once from Dart main() to register the batch dispatch port.
+/// After this call, all I/O completions are delivered as one kArray message
+/// per kevent() batch rather than as N individual messages.
+pub fn ZigIo_SetBatchPort(args: engine.Dart_NativeArguments) callconv(.c) void {
+    const port_handle = engine.Dart_GetNativeArgument(args, 0);
+    var port_id: engine.Dart_Port = 0;
+    if (engine.Dart_IsError(engine.Dart_SendPortGetId(port_handle, &port_id))) return;
+    const loop = state.current_loop orelse return;
+    loop.batch_port_ptr.* = port_id;
+}
+
+/// ZigIo_TcpAcceptToken(listenFd: int, token: int) → void
+/// Token-based variant of TcpAccept for use with the batch dispatcher.
+pub fn ZigIo_TcpAcceptToken(args: engine.Dart_NativeArguments) callconv(.c) void {
+    if (profiler.enabled) profiler.p.onNativeEntry(.accept);
+    var fd_val: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 0, &fd_val);
+    var token: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 1, &token);
+
+    const loop = state.current_loop orelse return;
+    const idx = state.allocSlot(loop.pool, loop.slot_alloc) orelse {
+        // Pool exhausted — post -1 immediately so the Dart Completer completes
+        // rather than hanging in _ZigIoDispatcher._pending indefinitely.
+        postTokenInt(loop, token, -1);
+        return;
+    };
+    const ctx = &loop.pool[idx];
+    ctx.op = .accept;
+    ctx.port_id = token;
+    ctx.fd = @intCast(fd_val);
+    ctx.tls_id = 0;
+    ctx.data = .{ .accept = {} };
+    if (profiler.enabled) profiler.p.onNativePost();
+    loop.ops.submit_accept(loop.ptr, idx, @intCast(fd_val));
+}
+
+/// ZigIo_TcpReadToken(connFd: int, maxBytes: int, token: int) → void
+/// Token-based variant of TcpRead for use with the batch dispatcher.
+pub fn ZigIo_TcpReadToken(args: engine.Dart_NativeArguments) callconv(.c) void {
+    if (profiler.enabled) profiler.p.onNativeEntry(.read);
+    var fd_val: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 0, &fd_val);
+    var max_val: i64 = state.kBufSize;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 1, &max_val);
+    var token: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 2, &token);
+
+    const loop = state.current_loop orelse return;
+    const idx = state.allocSlot(loop.pool, loop.slot_alloc) orelse {
+        // Pool exhausted — post null (EOF sentinel) so Dart treats this as a
+        // closed connection rather than a permanently pending future.
+        postTokenNull(loop, token);
+        return;
+    };
+    const ctx = &loop.pool[idx];
+    ctx.op = .recv;
+    ctx.port_id = token;
+    ctx.fd = @intCast(fd_val);
+    ctx.tls_id = 0;
+    ctx.data = .{ .recv = .{} };
+    if (profiler.enabled) profiler.p.onNativePost();
+    loop.ops.submit_recv(loop.ptr, idx, @intCast(fd_val));
+}
+
+/// ZigIo_TcpWriteBytesToken(connFd: int, bytes: Uint8List, token: int) → void
+/// Token-based variant of TcpWriteBytes for use with the batch dispatcher.
+pub fn ZigIo_TcpWriteBytesToken(args: engine.Dart_NativeArguments) callconv(.c) void {
+    if (profiler.enabled) profiler.p.onNativeEntry(.write);
+    var fd_val: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 0, &fd_val);
+
+    const list = engine.Dart_GetNativeArgument(args, 1);
+
+    var token: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 2, &token);
+
+    var data_type: c_int = 0;
+    var data_ptr: ?*anyopaque = null;
+    var data_len: isize = 0;
+    const acq = engine.Dart_TypedDataAcquireData(list, &data_type, &data_ptr, &data_len);
+    if (engine.Dart_IsError(acq) or data_ptr == null) {
+        _ = engine.Dart_TypedDataReleaseData(list);
+        // Acquire failed (not a typed-data object, or VM error).
+        if (state.current_loop) |loop| postTokenInt(loop, token, -1);
+        return;
+    }
+    if (data_len <= 0) {
+        _ = engine.Dart_TypedDataReleaseData(list);
+        // Empty Uint8List — complete immediately with 0 bytes written.
+        // No pool slot needed.
+        if (state.current_loop) |loop| postTokenInt(loop, token, 0);
+        return;
+    }
+
+    const loop = state.current_loop orelse {
+        _ = engine.Dart_TypedDataReleaseData(list);
+        return;
+    };
+    const idx = state.allocSlot(loop.pool, loop.slot_alloc) orelse {
+        _ = engine.Dart_TypedDataReleaseData(list);
+        // Pool exhausted — post error so the Dart future completes.
+        postTokenInt(loop, token, -1);
+        return;
+    };
+
+    const send_len: usize = @min(@as(usize, @intCast(data_len)), state.kBufSize);
+    const ctx = &loop.pool[idx];
+    ctx.op = .send;
+    ctx.port_id = token;
+    ctx.fd = @intCast(fd_val);
+    ctx.tls_id = 0;
+    ctx.data = .{ .send = .{ .len = send_len } };
+    @memcpy(ctx.data.send.buf[0..send_len], @as([*]u8, @ptrCast(data_ptr.?))[0..send_len]);
+    _ = engine.Dart_TypedDataReleaseData(list);
+
+    if (profiler.enabled) profiler.p.onNativePost();
+    loop.ops.submit_send(loop.ptr, idx, @intCast(fd_val), ctx.data.send.buf[0..send_len]);
+}
+
 /// ZigIo_TcpAccept(listenFd: int, sendPort: SendPort) → void
 /// Submits an async accept via the current event loop backend.
 pub fn ZigIo_TcpAccept(args: engine.Dart_NativeArguments) callconv(.c) void {
+    if (profiler.enabled) profiler.p.onNativeEntry(.accept);
     var fd_val: i64 = 0;
     _ = engine.Dart_GetNativeIntegerArgument(args, 0, &fd_val);
 
@@ -69,8 +246,10 @@ pub fn ZigIo_TcpAccept(args: engine.Dart_NativeArguments) callconv(.c) void {
     ctx.op = .accept;
     ctx.port_id = port_id;
     ctx.fd = @intCast(fd_val);
+    ctx.tls_id = 0;
     ctx.data = .{ .accept = {} };
 
+    if (profiler.enabled) profiler.p.onNativePost();
     loop.ops.submit_accept(loop.ptr, idx, @intCast(fd_val));
 }
 
@@ -78,6 +257,7 @@ pub fn ZigIo_TcpAccept(args: engine.Dart_NativeArguments) callconv(.c) void {
 /// Submits an async read into the pool slot's embedded recv buffer.
 /// No heap allocation: buf lives in CompletionCtx.recv.buf ([kBufSize]u8).
 pub fn ZigIo_TcpRead(args: engine.Dart_NativeArguments) callconv(.c) void {
+    if (profiler.enabled) profiler.p.onNativeEntry(.read);
     var fd_val: i64 = 0;
     _ = engine.Dart_GetNativeIntegerArgument(args, 0, &fd_val);
     var max_val: i64 = state.kBufSize;
@@ -88,11 +268,11 @@ pub fn ZigIo_TcpRead(args: engine.Dart_NativeArguments) callconv(.c) void {
     if (engine.Dart_IsError(engine.Dart_SendPortGetId(port_handle, &port_id))) return;
 
     const loop = state.current_loop orelse {
-        _ = engine.Dart_PostInteger(port_id, -1);
+        state.postRecvResult(port_id, -1, &.{});
         return;
     };
     const idx = state.allocSlot(loop.pool, loop.slot_alloc) orelse {
-        _ = engine.Dart_PostInteger(port_id, -1);
+        state.postRecvResult(port_id, -1, &.{});
         return;
     };
 
@@ -100,15 +280,18 @@ pub fn ZigIo_TcpRead(args: engine.Dart_NativeArguments) callconv(.c) void {
     ctx.op = .recv;
     ctx.port_id = port_id;
     ctx.fd = @intCast(fd_val);
+    ctx.tls_id = 0;
     ctx.data = .{ .recv = .{} }; // buf is the embedded [kBufSize]u8; no alloc needed
     // maxBytes hint is ignored: the backend reads up to kBufSize bytes.
 
+    if (profiler.enabled) profiler.p.onNativePost();
     loop.ops.submit_recv(loop.ptr, idx, @intCast(fd_val));
 }
 
 /// ZigIo_TcpWrite(connFd: int, bytes: List<int>, sendPort: SendPort) → void
 /// Submits an async write. Copies bytes into the pool slot's embedded send buffer.
 pub fn ZigIo_TcpWrite(args: engine.Dart_NativeArguments) callconv(.c) void {
+    if (profiler.enabled) profiler.p.onNativeEntry(.write);
     var fd_val: i64 = 0;
     _ = engine.Dart_GetNativeIntegerArgument(args, 0, &fd_val);
 
@@ -139,6 +322,7 @@ pub fn ZigIo_TcpWrite(args: engine.Dart_NativeArguments) callconv(.c) void {
     ctx.op = .send;
     ctx.port_id = port_id;
     ctx.fd = @intCast(fd_val);
+    ctx.tls_id = 0;
     ctx.data = .{ .send = .{ .len = send_len } };
 
     // Copy byte-by-byte from Dart List<int> into embedded send buffer.
@@ -149,6 +333,7 @@ pub fn ZigIo_TcpWrite(args: engine.Dart_NativeArguments) callconv(.c) void {
         byte.* = @intCast(v & 0xff);
     }
 
+    if (profiler.enabled) profiler.p.onNativePost();
     loop.ops.submit_send(loop.ptr, idx, @intCast(fd_val), ctx.data.send.buf[0..send_len]);
 }
 
@@ -192,6 +377,7 @@ pub fn ZigIo_TcpWriteBytes(args: engine.Dart_NativeArguments) callconv(.c) void 
     ctx.op = .send;
     ctx.port_id = port_id;
     ctx.fd = @intCast(fd_val);
+    ctx.tls_id = 0;
     ctx.data = .{ .send = .{ .len = send_len } };
 
     // Single memcpy from Dart heap into embedded send buffer.

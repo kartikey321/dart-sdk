@@ -8,6 +8,8 @@ const posix = std.posix;
 const linux = std.os.linux;
 const engine = @import("../engine.zig");
 const state = @import("../zig_io/state.zig");
+const tls_module = @import("../zig_io/tls.zig");
+const profiler = @import("../profiler.zig");
 
 const notify_user_data: u64 = 1;
 const timeout_user_data: u64 = 2;
@@ -22,9 +24,13 @@ pub const EventLoop = struct {
     notify_buf: u64,
     signal_buf: linux.signalfd_siginfo,
     timeout_ts: linux.kernel_timespec,
-    // Heap-allocated: 256 × ~8 KB = 2 MB; too large for the stack.
+    // Heap-allocated: 4096 × ~8 KB = 32 MB; too large for the stack.
     pool: *[state.kPoolSize]state.CompletionCtx,
     slot_alloc: state.SlotAllocator,
+    /// Set by ZigIo_SetBatchPort once Dart main() initialises the dispatcher.
+    /// When non-zero, completions are batched into one CObject_kArray per
+    /// copy_cqes() call instead of N individual Dart_PostInteger/PostCObject calls.
+    batch_port_id: engine.Dart_Port = 0,
 
     pub fn init(isolate: engine.DartHandle) !EventLoop {
         var ring = try linux.IoUring.init(256, 0);
@@ -50,7 +56,7 @@ pub const EventLoop = struct {
         const signal_fd = @as(posix.fd_t, @intCast(signal_fd_raw));
         errdefer posix.close(signal_fd);
 
-        // Heap-allocate the pool (256 × ~8 KB = 2 MB).
+        // Heap-allocate the pool (4096 × ~8 KB = 32 MB).
         const pool = try std.heap.c_allocator.create([state.kPoolSize]state.CompletionCtx);
         errdefer std.heap.c_allocator.destroy(pool);
         for (pool) |*ctx| ctx.* = .{};
@@ -104,11 +110,14 @@ pub const EventLoop = struct {
 
     pub fn run(self: *EventLoop) void {
         // Expose this loop to tcp.zig natives running on this thread.
+        // batch_port_ptr points into self so the address is stable for the
+        // lifetime of run() — ZigIo_SetBatchPort writes through it.
         state.current_loop = .{
             .ptr = self,
             .ops = &uring_ops,
             .pool = self.pool,
             .slot_alloc = &self.slot_alloc,
+            .batch_port_ptr = &self.batch_port_id,
         };
         defer state.current_loop = null;
 
@@ -129,27 +138,49 @@ pub const EventLoop = struct {
             while (true) {
                 const n = self.ring.copy_cqes(&cqes, 0) catch break;
                 if (n == 0) break;
+                if (profiler.enabled and n > 0) profiler.p.onKeventReturn(@intCast(n));
+
+                // Batch buffer: one entry per pool CQE in this copy_cqes() call.
+                // Mirrors kqueue's per-kevent() flush granularity.
+                var batch: [32]BatchEntry = undefined;
+                var batch_n: usize = 0;
 
                 var i: usize = 0;
                 while (i < n) : (i += 1) {
                     const cqe = cqes[i];
 
                     if (cqe.user_data == notify_user_data) {
-                        // Drain the pending counter atomically: schedule_callback
-                        // only writes to eventfd once (on idle→busy transition), so
-                        // notify_buf is always 1. Use pending.swap(0) to get the
-                        // real number of messages that have accumulated.
-                        const count: i32 = @intCast(@max(1, self.pending.swap(0, .acquire)));
+                        // Drain a snapshot of pending messages while keeping pending>0.
+                        // This suppresses extra eventfd writes during the drain:
+                        // schedule_callback only writes on 0->1 transitions.
+                        const count: i32 = @intCast(@max(1, self.pending.load(.acquire)));
                         var processed: i32 = 0;
                         while (processed < count) : (processed += 1) {
                             if (self.isolate != null) {
                                 engine.DartEngine_HandleMessage(self.isolate);
                             }
                         }
+                        // Drain microtask queue so async continuations run.
+                        if (self.isolate != null) {
+                            engine.DartEngine_AcquireIsolate(self.isolate);
+                            engine.Dart_EnterScope();
+                            _ = engine.DartEngine_DrainMicrotasksQueue();
+                            engine.Dart_ExitScope();
+                            engine.DartEngine_ReleaseIsolate();
+                        }
+                        const old_pending = self.pending.fetchSub(count, .acq_rel);
+                        const remaining: i32 = if (old_pending > count) old_pending - count else 0;
+                        if (remaining > 0) {
+                            const one: u64 = 1;
+                            _ = posix.write(self.notify_fd, std.mem.asBytes(&one)) catch {};
+                        }
                         self.notify_buf = 0;
                         self.armNotifyRead() catch {};
                     } else if (cqe.user_data == signal_user_data) {
-                        // SIGINT or SIGTERM — graceful shutdown
+                        // SIGINT or SIGTERM — graceful shutdown.
+                        // Flush any pending batch so in-flight completions are delivered
+                        // before the event loop exits (prevents hanging Dart futures).
+                        if (batch_n > 0) self.flushBatch(batch[0..batch_n]);
                         return;
                     } else if (cqe.user_data == timeout_user_data and
                         cqe.res == -@as(i32, @intFromEnum(linux.E.TIME)))
@@ -162,18 +193,271 @@ pub const EventLoop = struct {
                                 engine.Dart_NotifyIdle(std.time.microTimestamp() + 5_000);
                                 const live = engine.Dart_HasLivePorts();
                                 engine.DartEngine_ReleaseIsolate();
-                                if (!live) return;
+                                if (!live) {
+                                    if (batch_n > 0) self.flushBatch(batch[0..batch_n]);
+                                    return;
+                                }
                             }
                         }
                         self.armTimeout() catch return;
                     } else if (cqe.user_data >= state.kPoolBase) {
-                        self.dispatchPoolCqe(cqe);
                         any_io = true;
+                        if (self.batch_port_id != 0) {
+                            // Batch path: collect result now, post after all CQEs processed.
+                            if (self.collectPoolCqe(cqe, &batch[batch_n])) {
+                                batch_n += 1;
+                            }
+                        } else {
+                            // Legacy path: post each completion individually.
+                            // Used before ZigIo_SetBatchPort is called from Dart main().
+                            self.dispatchPoolCqe(cqe);
+                        }
                     }
+                }
+
+                // Post one batch message for all I/O completions in this copy_cqes() call.
+                // Dart_PostCObject copies kTypedData bytes synchronously → safe to free
+                // slots after. Mirrors kqueue's per-kevent() flushBatch call.
+                if (batch_n > 0) {
+                    self.flushBatch(batch[0..batch_n]);
                 }
             }
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Batch types — mirror of kqueue.zig BatchKind / BatchEntry.
+    // -------------------------------------------------------------------------
+
+    const BatchKind = enum { int_val, null_val, typed_data };
+
+    const BatchEntry = struct {
+        token: engine.Dart_Port,
+        slot_idx: usize,
+        kind: BatchKind,
+        int_val: i64 = 0,
+        bytes_len: usize = 0,
+    };
+
+    // -------------------------------------------------------------------------
+    // collectPoolCqe — extract result from a pool CQE into a BatchEntry.
+    // Returns true if the entry was populated; false if the slot was invalid.
+    // -------------------------------------------------------------------------
+
+    fn collectPoolCqe(self: *EventLoop, cqe: linux.io_uring_cqe, out: *BatchEntry) bool {
+        const raw_idx = cqe.user_data - state.kPoolBase;
+        if (raw_idx >= state.kPoolSize) return false;
+        const idx: usize = @intCast(raw_idx);
+        const ctx = &self.pool[idx];
+        if (!ctx.in_use) return false;
+
+        out.token = ctx.port_id;
+        out.slot_idx = idx;
+
+        switch (ctx.op) {
+            .accept => {
+                // cqe.res is the new conn fd (>=0) or -errno on error.
+                if (cqe.res >= 0) setTcpNoDelay(@intCast(cqe.res));
+                out.kind = .int_val;
+                out.int_val = @as(i64, cqe.res);
+                return true;
+            },
+            .recv => {
+                // cqe.res > 0: bytes received; 0: EOF; <0: error.
+                if (cqe.res > 0) {
+                    out.kind = .typed_data;
+                    out.bytes_len = @intCast(cqe.res);
+                } else {
+                    out.kind = .null_val;
+                }
+                return true;
+            },
+            .send => {
+                // cqe.res is bytes sent (>=0) or -errno.
+                out.kind = .int_val;
+                out.int_val = @as(i64, cqe.res);
+                return true;
+            },
+            .tls_handshake => {
+                const tls_id = ctx.tls_id;
+                if (tls_id == 0 or cqe.res <= 0) {
+                    out.kind = .int_val;
+                    out.int_val = -1;
+                    if (tls_id != 0) tls_module.freeConn(tls_id);
+                    return true;
+                }
+                if (!tls_module.feedRecv(tls_id, ctx.data.recv.buf[0..@intCast(cqe.res)])) {
+                    out.kind = .int_val;
+                    out.int_val = -1;
+                    tls_module.freeConn(tls_id);
+                    return true;
+                }
+
+                switch (tls_module.advanceHandshake(tls_id)) {
+                    .done => {
+                        out.kind = .int_val;
+                        out.int_val = tls_id;
+                        return true;
+                    },
+                    .want_read, .want_write => {
+                        _ = self.ring.read(
+                            cqe.user_data,
+                            ctx.fd,
+                            .{ .buffer = ctx.data.recv.buf[0..] },
+                            0,
+                        ) catch {
+                            out.kind = .int_val;
+                            out.int_val = -1;
+                            tls_module.freeConn(tls_id);
+                            return true;
+                        };
+                        return false;
+                    },
+                    .err => {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        tls_module.freeConn(tls_id);
+                        return true;
+                    },
+                }
+            },
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // flushBatch — build one Dart_CObject_kArray with
+    // [token0, value0, token1, value1, ...] and post it to batch_port_id.
+    // All pool slots are freed after the post (kTypedData bytes are copied
+    // synchronously by Dart_PostCObject before this function returns).
+    // -------------------------------------------------------------------------
+
+    fn flushBatch(self: *EventLoop, batch: []BatchEntry) void {
+        var token_objs: [32]engine.Dart_CObject = undefined;
+        var value_objs: [32]engine.Dart_CObject = undefined;
+        var ptrs: [64]?*engine.Dart_CObject = undefined;
+
+        for (batch, 0..) |entry, i| {
+            token_objs[i] = .{
+                .@"type" = engine.Dart_CObject_kInt64,
+                .value = .{ .as_int64 = entry.token },
+            };
+            value_objs[i] = switch (entry.kind) {
+                .int_val => .{
+                    .@"type" = engine.Dart_CObject_kInt64,
+                    .value = .{ .as_int64 = entry.int_val },
+                },
+                .null_val => .{
+                    .@"type" = engine.Dart_CObject_kNull,
+                    .value = .{ .as_int64 = 0 },
+                },
+                .typed_data => .{
+                    .@"type" = engine.Dart_CObject_kTypedData,
+                    .value = .{ .as_typed_data = .{
+                        .data_type = engine.Dart_TypedData_kUint8,
+                        .length = @intCast(entry.bytes_len),
+                        .values = self.pool[entry.slot_idx].data.recv.buf[0..entry.bytes_len].ptr,
+                    } },
+                },
+            };
+            ptrs[2 * i] = &token_objs[i];
+            ptrs[2 * i + 1] = &value_objs[i];
+        }
+
+        var batch_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kArray,
+            .value = .{ .as_array = .{
+                .length = @intCast(2 * batch.len),
+                .values = ptrs[0..].ptr,
+            } },
+        };
+        if (profiler.enabled) profiler.p.onFlushBatch();
+        _ = engine.Dart_PostCObject(self.batch_port_id, &batch_obj);
+
+        // Free all slots after posting — kTypedData bytes were copied synchronously.
+        for (batch) |entry| {
+            state.freeSlot(self.pool, &self.slot_alloc, entry.slot_idx);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // postSingleCompletion — post one completion, routing through the batch
+    // port when active (batch_port_id != 0) or falling back to direct posting.
+    //
+    // Used by submit* vtable functions for their synchronous fast-path and
+    // error cases — these can fire both before and after batch mode is enabled.
+    // slot_idx is only accessed for .typed_data (recv buffer pointer); pass 0
+    // for .int_val and .null_val cases.
+    // -------------------------------------------------------------------------
+
+    fn postSingleCompletion(
+        self: *EventLoop,
+        token: engine.Dart_Port,
+        slot_idx: usize,
+        kind: BatchKind,
+        int_val: i64,
+        bytes_len: usize,
+    ) void {
+        if (self.batch_port_id != 0) {
+            // Batch mode: wrap as a 2-element kArray [token, value] so the
+            // Dart _ZigIoDispatcher._onBatch handler can route it correctly.
+            var token_obj = engine.Dart_CObject{
+                .@"type" = engine.Dart_CObject_kInt64,
+                .value = .{ .as_int64 = token },
+            };
+            var value_obj: engine.Dart_CObject = switch (kind) {
+                .int_val => .{
+                    .@"type" = engine.Dart_CObject_kInt64,
+                    .value = .{ .as_int64 = int_val },
+                },
+                .null_val => .{
+                    .@"type" = engine.Dart_CObject_kNull,
+                    .value = .{ .as_int64 = 0 },
+                },
+                .typed_data => .{
+                    .@"type" = engine.Dart_CObject_kTypedData,
+                    .value = .{ .as_typed_data = .{
+                        .data_type = engine.Dart_TypedData_kUint8,
+                        .length = @intCast(bytes_len),
+                        .values = self.pool[slot_idx].data.recv.buf[0..bytes_len].ptr,
+                    } },
+                },
+            };
+            var ptrs = [2]?*engine.Dart_CObject{ &token_obj, &value_obj };
+            var obj = engine.Dart_CObject{
+                .@"type" = engine.Dart_CObject_kArray,
+                .value = .{ .as_array = .{
+                    .length = 2,
+                    .values = ptrs[0..].ptr,
+                } },
+            };
+            _ = engine.Dart_PostCObject(self.batch_port_id, &obj);
+            return;
+        }
+
+        // Legacy mode: post directly to the real Dart_Port stored in token.
+        switch (kind) {
+            .int_val => {
+                _ = engine.Dart_PostInteger(token, int_val);
+            },
+            .null_val => {
+                // EOF / error on recv — post null via postRecvResult helper.
+                state.postRecvResult(token, -1, self.pool[slot_idx].data.recv.buf[0..0]);
+            },
+            .typed_data => {
+                state.postRecvResult(
+                    token,
+                    @intCast(bytes_len),
+                    self.pool[slot_idx].data.recv.buf[0..bytes_len],
+                );
+            },
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // dispatchPoolCqe — legacy (non-batch) dispatch.
+    // Only called when batch_port_id == 0 (before ZigIo_SetBatchPort fires).
+    // In this mode ctx.port_id is a real Dart_Port, not a token.
+    // -------------------------------------------------------------------------
 
     fn dispatchPoolCqe(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         const raw_idx = cqe.user_data - state.kPoolBase;
@@ -197,7 +481,47 @@ pub const EventLoop = struct {
             },
             .send => {
                 _ = engine.Dart_PostInteger(ctx.port_id, cqe.res);
-                state.freeSlot(self.pool, &self.slot_alloc, idx); // buf is embedded, no heap free
+                state.freeSlot(self.pool, &self.slot_alloc, idx);
+            },
+            .tls_handshake => {
+                const tls_id = ctx.tls_id;
+                if (tls_id == 0 or cqe.res <= 0) {
+                    _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                    if (tls_id != 0) tls_module.freeConn(tls_id);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+                if (!tls_module.feedRecv(tls_id, ctx.data.recv.buf[0..@intCast(cqe.res)])) {
+                    _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                    tls_module.freeConn(tls_id);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+
+                switch (tls_module.advanceHandshake(tls_id)) {
+                    .done => {
+                        _ = engine.Dart_PostInteger(ctx.port_id, tls_id);
+                        state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    },
+                    .want_read, .want_write => {
+                        _ = self.ring.read(
+                            cqe.user_data,
+                            ctx.fd,
+                            .{ .buffer = ctx.data.recv.buf[0..] },
+                            0,
+                        ) catch {
+                            _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                            tls_module.freeConn(tls_id);
+                            state.freeSlot(self.pool, &self.slot_alloc, idx);
+                            return;
+                        };
+                    },
+                    .err => {
+                        _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                        tls_module.freeConn(tls_id);
+                        state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    },
+                }
             },
         }
     }
@@ -234,6 +558,10 @@ pub const EventLoop = struct {
 // io_uring vtable — called by tcp.zig natives from the event-loop thread.
 // SQEs are queued here; they are submitted to the kernel on the next
 // submit_and_wait() call at the top of run()'s loop.
+//
+// Error paths use postSingleCompletion() so completions are correctly routed
+// to the batch port when active — preventing hanging Dart futures on errors
+// that occur after ZigIo_SetBatchPort has been called.
 // ---------------------------------------------------------------------------
 
 const uring_ops = state.LoopOps{
@@ -248,7 +576,9 @@ fn submitAccept(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
     const user_data: u64 = state.kPoolBase + @as(u64, slot_idx);
     const accept_flags: u32 = linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
     _ = self.ring.accept(user_data, fd, null, null, accept_flags) catch {
-        _ = engine.Dart_PostInteger(ctx.port_id, -1);
+        // SQE submission failed — post error immediately so the Dart future
+        // (or raw port) completes rather than hanging indefinitely.
+        self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     };
 }
@@ -259,7 +589,7 @@ fn submitRecv(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
     const user_data: u64 = state.kPoolBase + @as(u64, slot_idx);
     // Kernel reads directly into the pool slot's embedded recv buffer — no alloc.
     _ = self.ring.read(user_data, fd, .{ .buffer = ctx.data.recv.buf[0..] }, 0) catch {
-        state.postRecvResult(ctx.port_id, -1, ctx.data.recv.buf[0..0]);
+        self.postSingleCompletion(ctx.port_id, slot_idx, .null_val, 0, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     };
 }
@@ -277,21 +607,22 @@ fn submitSend(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t, buf: []u8) void
     // does (SocketBase::Write → write() before any epoll registration).
     const n = posix.write(fd, buf) catch |err| blk: {
         if (err == error.WouldBlock) break :blk @as(usize, 0); // EAGAIN → SQE path
-        // Hard error (EBADF, EPIPE, etc.) — notify Dart immediately.
-        _ = engine.Dart_PostInteger(ctx.port_id, -1);
+        // Hard error (EBADF, EPIPE, etc.) — notify Dart immediately via
+        // postSingleCompletion so batch-mode futures complete on errors too.
+        self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
         return;
     };
     if (n > 0) {
         // Full or partial write succeeded inline.
         // Post result directly — no SQE needed, one fewer kernel round-trip.
-        _ = engine.Dart_PostInteger(ctx.port_id, @intCast(n));
+        self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, @intCast(n), 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
         return;
     }
     // n == 0 means EAGAIN: send buffer full. Fall through to async SQE.
     _ = self.ring.write(user_data, fd, buf, 0) catch {
-        _ = engine.Dart_PostInteger(ctx.port_id, -1);
+        self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     };
 }

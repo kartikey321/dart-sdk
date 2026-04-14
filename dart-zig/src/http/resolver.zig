@@ -2,14 +2,11 @@ const std = @import("std");
 const engine = @import("../engine.zig");
 const table = @import("native_table.zig").table;
 
-/// Called by the Dart VM to resolve a native function by name + arity.
-/// Returns null if not found (causes a NoSuchMethodError in Dart).
-pub fn ZigIoNativeLookup(
+pub fn ZigHttpNativeLookup(
     name: engine.DartHandle,
     argc: c_int,
     auto_setup_scope: *bool,
 ) callconv(.c) engine.Dart_NativeFunction {
-    // Dart_StringToCString requires an active scope (set up before this call).
     var name_cstr: [*:0]const u8 = undefined;
     if (engine.Dart_IsError(engine.Dart_StringToCString(name, &name_cstr))) return null;
     const name_str = std.mem.span(name_cstr);
@@ -20,16 +17,10 @@ pub fn ZigIoNativeLookup(
             return entry.func;
         }
     }
-    // Not found — print name+argc to stderr for debugging.
-    var buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "UNRESOLVED:{s}#{d}\n", .{ name_str, argc }) catch "UNRESOLVED\n";
-    _ = std.posix.write(2, msg) catch {};
     return null;
 }
 
-/// Called by the Dart VM to obtain the C symbol name for a native function
-/// (used for --print-snapshot-sizes and similar tooling).
-pub fn ZigIoNativeSymbol(func: engine.Dart_NativeFunction) callconv(.c) [*:0]const u8 {
+pub fn ZigHttpNativeSymbol(func: engine.Dart_NativeFunction) callconv(.c) [*:0]const u8 {
     for (table) |entry| {
         if (entry.func == func) return entry.name;
     }

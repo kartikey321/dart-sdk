@@ -143,10 +143,16 @@ Re-export dart_engine.h                 signal bridge
 | 5 | GC idle (`Dart_NotifyIdle`) + signal handling (signalfd / EVFILT_SIGNAL) | ✅ DONE | `io_uring.zig`, `kqueue.zig` |
 | 6 | Zig I/O natives via `Dart_SetNativeResolver`; thread-based async as scaffold | ✅ DONE | `src/zig_io/`, `lib/zig_io.dart` |
 | 7 | Real async I/O: replace threads with io_uring SQEs / kqueue readiness | ✅ DONE | `src/zig_io/state.zig`, `natives/tcp.zig` |
-| **8** | **`Dart_PostCObject` for TcpRead data; `ZigIo_TcpWriteBytes`; echo server + benchmark** | 🔄 **IN PROGRESS** | `engine.zig`, `tcp.zig`, `lib/echo_server.dart` |
-| 9 | True zero-copy: `Dart_NewExternalTypedDataWithFinalizer` + io_uring registered buffers | 📋 PLANNED | `io_uring.zig`, `tcp.zig` |
-| 10 | Multi-core: `SO_REUSEPORT` + per-isolate rings via `create_group` callback | 📋 PLANNED | `main.zig`, `engine.zig` |
-| 11 | `IORING_OP_SEND_ZC` for zero-copy sends; `SPLICE` for file/proxy serving | 📋 PLANNED | `io_uring.zig` |
+| 8 | `Dart_PostCObject` for TcpRead data; `ZigIo_TcpWriteBytes`; echo server + benchmark | ✅ DONE | `engine.zig`, `tcp.zig`, `lib/echo_server.dart` |
+| 9 | O(1) free-list pool allocator; benchmark correctness; SOCK.NONBLOCK; TCP_NODELAY | ✅ DONE | `state.zig`, `io_uring.zig`, `kqueue.zig` |
+| 10 | io_uring inline write fast-path (Phase 10c): eliminate send SQE round-trip | ✅ DONE | `io_uring.zig` |
+| 11 | AOT compilation support: `-Daot=true`, `DartEngine_AotSnapshotFromFile`, auto-detect by extension | ✅ DONE | `build.zig`, `engine.zig`, `main.zig` |
+| **12** | **SO_REUSEPORT multicore: N isolates × N event loops, kernel-distributed accept** | ✅ **DONE** | `main.zig`, `tcp.zig` |
+| 13 | HTTP/1.1 native parser in Zig; Dart receives structured `HttpRequest` | 📋 PLANNED | `src/http/parser.zig`, `lib/zig_http.dart` |
+| 14 | Completion batching: N completions per Dart wakeup, reduce scheduler overhead | 📋 PLANNED | `event_loop/`, `state.zig` |
+| 15 | TLS via BoringSSL: termination in Zig before bytes reach Dart | 📋 PLANNED | `src/tls/` |
+| 16 | HTTP/2: h2c cleartext first, HPACK + stream mux, then TLS | 📋 PLANNED | `src/http2/` |
+| 17 | HTTP/3 via quiche (Cloudflare): UDP path, QUIC, requires Phase 15 TLS | 📋 PLANNED | `src/quic/` |
 
 ---
 
@@ -246,36 +252,116 @@ in kernel page tables — eliminates the `iommu_map` on every I/O operation.
 
 ---
 
-## Phase 10: Multi-Core via SO_REUSEPORT
+## Phase 12: SO_REUSEPORT Multicore ✅ DONE
 
-One (Dart isolate + io_uring ring) pair per CPU core. Kernel distributes connections
-via `SO_REUSEPORT` with zero cross-thread coordination:
+One (Dart isolate + event loop) pair per CPU core. Kernel distributes incoming
+connections across workers via `SO_REUSEPORT` — zero cross-thread coordination,
+no mutex, no work-stealing.
+
+### Design
 
 ```zig
 // main.zig
-const n = try std.Thread.getCpuCount();
-for (0..n) |i| {
-    _ = try std.Thread.spawn(.{}, workerMain, .{ snapshot, listen_fd, i });
-}
+const n_workers = try std.Thread.getCpuCount();
+var threads = try allocator.alloc(std.Thread, n_workers);
 
-fn workerMain(snapshot: engine.DartSnapshot, listen_fd: posix.fd_t, id: usize) void {
-    var loop = EventLoop.init(null) catch return;
-    // Each worker gets its own SO_REUSEPORT socket for zero-lock accept
-    loop.run();
+for (0..n_workers) |i| {
+    threads[i] = try std.Thread.spawn(.{}, workerMain, .{ snapshot_path, i });
+}
+for (threads) |t| t.join();
+
+fn workerMain(snapshot_path: [:0]const u8, worker_id: usize) void {
+    // Each worker: its own engine init, isolate, event loop
+    // Listens on the same port via SO_REUSEPORT — kernel load-balances
+    runWorker(snapshot_path, worker_id) catch |e| {
+        std.debug.print("worker {d} fatal: {s}\n", .{ worker_id, @errorName(e) });
+    };
 }
 ```
 
-Requires `create_group` callback in the engine to allow cross-thread isolate creation.
+### Key changes
+- `main.zig`: detect `-workers=N` arg (default: `std.Thread.getCpuCount()`), spawn N threads each running `workerMain`
+- `event_loop/kqueue.zig` + `io_uring.zig`: accept socket created with `SO_REUSEPORT` so kernel assigns connections to whichever worker's accept queue is free
+- Each worker calls `DartEngine_Init` / `DartEngine_CreateIsolate` independently (engine supports multiple isolates)
+- No shared state between workers — each isolate has its own pool, slot allocator, event loop
+
+### Expected outcome
+~N× throughput on N-core machine. M3 Pro has 11 performance cores → target: 2.5M+ req/s echo (AOT).
 
 ---
 
-## Phase 11: IORING_OP_SEND_ZC + SPLICE
+## Phase 13: HTTP/1.1 Native Parser ✅ DONE
 
-- **`SEND_ZC`**: submit send with `IORING_OP_SEND_ZC`; buffer must be Zig-owned (GC cannot
-  move it). Wait for `IORING_CQE_F_NOTIF` before freeing. Net gain: eliminates kernel
-  copy on send for large payloads.
-- **`SPLICE`**: `IORING_OP_SPLICE` for file serving and proxy use cases — kernel-to-kernel
-  transfer, zero userspace buffer at all.
+Zig parses request line + headers. Dart receives a structured `HttpRequest` object,
+not raw bytes. Body streaming stays Dart-side.
+
+```zig
+// src/http/parser.zig — zero-allocation state machine
+const ParseResult = union(enum) {
+    incomplete,
+    complete: HttpRequest,
+    error: ParseError,
+};
+
+const HttpRequest = struct {
+    method: []const u8,
+    path:   []const u8,
+    // headers stored as index into raw buffer — no allocation
+    headers: [32]Header,
+    header_count: usize,
+    body_offset: usize,
+};
+```
+
+Dart side:
+```dart
+// lib/zig_http.dart
+@pragma('vm:external-name', 'ZigHttp_Listen')
+external void zigHttpListen(int port, void Function(HttpRequest req) handler);
+```
+
+---
+
+## Phase 14: Completion Batching ✅ DONE
+
+Instead of one `DartEngine_HandleMessage` per completion, accumulate up to N
+completions in the event loop tick before notifying Dart. Reduces scheduler
+overhead under high connection counts.
+
+**Implemented:** Single `RawReceivePort` per isolate + `Map<int, Completer>` token
+map. Zig posts one `Dart_CObject_kArray` (`[token0,val0,...]`) per `kevent()` batch.
+`postSingleCompletion()` helper routes error/fast-path completions correctly in both
+batch and legacy mode. Benchmark: **159k req/sec (c=128), 150k req/sec (c=400)** —
+stable at high concurrency (was crashing in Phase 13 at c=400).
+
+---
+
+## Phase 15: TLS via BoringSSL ✅ DONE
+
+BoringSSL is already in the SDK tree (Dart uses it internally). Link it from
+Zig, do TLS termination before bytes reach the Dart handler. Required for
+browser-facing HTTP/2 and for QUIC (HTTP/3).
+
+**Completed 2026-03-21.** Memory BIOs (`BIO_new_bio_pair` ×2), TlsConn pool,
+`advanceHandshake` kqueue state machine, synchronous `writePlaintext`,
+`SSL_pending` fast-path for buffered post-handshake data. kqueue pipe wake-up
+bug fixed (unconditional `pipe_w` write after `flushBatch`).
+Benchmark: **50,643 HTTPS req/sec** (c=50, macOS, 1 worker).
+
+---
+
+## Phase 16: HTTP/2
+
+h2c (cleartext) first for internal/gRPC use, then TLS-backed H2 after Phase 15.
+HPACK header compression + stream multiplexing. Dart gets `Http2Stream` objects.
+
+---
+
+## Phase 17: HTTP/3 via quiche
+
+Link Cloudflare's quiche C library for QUIC + HTTP/3. New UDP socket path in
+Zig, separate from the TCP kqueue/io_uring backends. Requires Phase 15 (TLS 1.3
+is mandatory for QUIC).
 
 ---
 

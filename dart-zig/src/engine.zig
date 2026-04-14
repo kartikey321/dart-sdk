@@ -26,6 +26,8 @@ pub extern fn DartEngine_KernelFromFile(path: [*:0]const u8, err: *?[*:0]u8) Sna
 pub extern fn DartEngine_AotSnapshotFromFile(path: [*:0]const u8, err: *?[*:0]u8) SnapshotData;
 pub extern fn DartEngine_CreateIsolate(snapshot: SnapshotData, err: *?[*:0]u8) DartHandle;
 pub extern fn DartEngine_HandleMessage(isolate: DartHandle) void;
+pub extern fn Dart_HandleMessage() DartHandle;
+pub extern fn DartEngine_DrainMicrotasksQueue() DartHandle;
 pub extern fn DartEngine_AcquireIsolate(isolate: DartHandle) void;
 pub extern fn DartEngine_ReleaseIsolate() void;
 pub extern fn DartEngine_SetHooks(hooks: DartZigIoHooks) void;
@@ -110,7 +112,6 @@ pub const Dart_TypedData_kUint8: c_int = 2;
 pub const Dart_Port = i64;
 pub extern fn Dart_SendPortGetId(port: DartHandle, port_id: *Dart_Port) DartHandle;
 pub extern fn Dart_PostInteger(port_id: Dart_Port, value: i64) bool;
-pub extern fn Dart_PostNull(port_id: Dart_Port) bool;
 
 // Dart_CObject — cross-thread message type (dart_native_api.h)
 // Layout must match the C struct exactly.  The union's largest member is
@@ -118,6 +119,7 @@ pub extern fn Dart_PostNull(port_id: Dart_Port) bool;
 pub const Dart_CObject_Type = c_int;
 pub const Dart_CObject_kNull: Dart_CObject_Type = 0;
 pub const Dart_CObject_kInt64: Dart_CObject_Type = 3;
+pub const Dart_CObject_kArray: Dart_CObject_Type = 6;
 pub const Dart_CObject_kTypedData: Dart_CObject_Type = 7;
 pub const Dart_CObject_kExternalTypedData: Dart_CObject_Type = 8;
 
@@ -132,6 +134,12 @@ pub const Dart_CObject = extern struct {
     @"type": Dart_CObject_Type,
     value: extern union {
         as_int64: i64,
+        // kArray: flat list of Dart_CObject pointers.
+        // Used by completion batching (Phase 14) to deliver N results in one message.
+        as_array: extern struct {
+            length: isize,
+            values: [*]?*Dart_CObject,
+        },
         as_typed_data: extern struct {
             data_type: c_int, // Dart_TypedData_Type (kUint8 = 2)
             length: isize, // in elements (= bytes for Uint8List)

@@ -8,6 +8,8 @@ const posix = std.posix;
 const c = std.c;
 const engine = @import("../engine.zig");
 const state = @import("../zig_io/state.zig");
+const tls_module = @import("../zig_io/tls.zig");
+const profiler = @import("../profiler.zig");
 
 // kqueue filter constants not exposed in std.c on all Zig versions
 const EVFILT_SIGNAL: i16 = -6;
@@ -19,9 +21,12 @@ pub const EventLoop = struct {
     pipe_w: posix.fd_t,
     isolate: engine.DartHandle,
     pending: std.atomic.Value(i32),
-    // Heap-allocated: 256 × ~8 KB = 2 MB; too large for the stack.
+    // Heap-allocated: 4096 × ~8 KB = 32 MB; too large for the stack.
     pool: *[state.kPoolSize]state.CompletionCtx,
     slot_alloc: state.SlotAllocator,
+    /// Set by ZigIo_SetBatchPort once Dart main() initialises the dispatcher.
+    /// When non-zero, completions are batched into one CObject_kArray per kevent() call.
+    batch_port_id: engine.Dart_Port = 0,
 
     pub fn init(isolate: engine.DartHandle) !EventLoop {
         const kq = try posix.kqueue();
@@ -135,6 +140,7 @@ pub const EventLoop = struct {
             .ops = &kqueue_ops,
             .pool = self.pool,
             .slot_alloc = &self.slot_alloc,
+            .batch_port_ptr = &self.batch_port_id,
         };
         defer state.current_loop = null;
 
@@ -145,8 +151,13 @@ pub const EventLoop = struct {
         var events: [32]posix.Kevent = undefined;
         var no_changes: [0]posix.Kevent = .{};
 
+        // Batch buffer: at most one entry per event in the kevent() batch.
+        var batch: [32]BatchEntry = undefined;
+        var batch_n: usize = 0;
+
         while (true) {
             const n = posix.kevent(self.kq, no_changes[0..], events[0..], &timeout_200ms) catch break;
+            if (profiler.enabled and n > 0) profiler.p.onKeventReturn(@intCast(n));
 
             if (n == 0) {
                 // Idle timeout — notify GC + check live ports.
@@ -160,6 +171,8 @@ pub const EventLoop = struct {
                 continue;
             }
 
+            batch_n = 0;
+
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 const event = events[i];
@@ -169,17 +182,22 @@ pub const EventLoop = struct {
 
                 // Pool slot I/O event (udata >= kPoolBase)
                 if (event.udata >= @as(usize, state.kPoolBase)) {
-                    self.dispatchPoolEvent(event);
+                    if (self.batch_port_id != 0) {
+                        // Batch path: perform I/O now, defer posting until after loop.
+                        if (self.collectPoolEvent(event, &batch[batch_n])) {
+                            batch_n += 1;
+                        }
+                    } else {
+                        // Fallback: post individually (batch port not yet initialised).
+                        self.dispatchPoolEvent(event);
+                    }
                     continue;
                 }
 
-                // Message pipe ready
+                // Message pipe ready — process queued Dart messages.
                 if (event.ident == @as(usize, @intCast(self.pipe_r))) {
-                    // Drain all bytes from the pipe (schedule_callback only writes
-                    // one byte per idle→busy transition, so byte count ≠ message count).
-                    // Use pending.swap(0) to get the real number of queued messages.
                     _ = self.drainPipe();
-                    const count: i32 = @intCast(@max(1, self.pending.swap(0, .acquire)));
+                    const count: i32 = @intCast(@max(1, self.pending.swap(0, .acq_rel)));
                     var processed: i32 = 0;
                     while (processed < count) : (processed += 1) {
                         if (self.isolate != null) {
@@ -188,9 +206,229 @@ pub const EventLoop = struct {
                     }
                 }
             }
+
+            // Post one batch message for all I/O completions collected this iteration.
+            // Dart_PostCObject copies kTypedData bytes synchronously → safe to free slots after.
+            if (batch_n > 0) {
+                self.flushBatch(batch[0..batch_n]);
+            }
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // Per-entry result collected during a kevent() batch.
+    // ---------------------------------------------------------------------------
+    const BatchKind = enum { int_val, null_val, typed_data };
+    const BatchEntry = struct {
+        token: engine.Dart_Port,
+        slot_idx: usize,
+        kind: BatchKind,
+        int_val: i64 = 0,
+        bytes_len: usize = 0,
+    };
+
+    fn armTlsHandshake(self: *EventLoop, idx: usize, fd: posix.fd_t, wait_write: bool) bool {
+        const filter: i16 = if (wait_write) EVFILT_WRITE else @as(i16, c.EVFILT.READ);
+        const udata = @as(usize, state.kPoolBase) + idx;
+        return addKevent(
+            self.kq,
+            @intCast(fd),
+            filter,
+            @as(u16, c.EV.ADD | c.EV.ENABLE | c.EV.ONESHOT),
+            udata,
+        );
+    }
+
+    /// Perform the I/O syscall for a pool event and record the result in `out`.
+    /// Returns true if a result was recorded; false if the event was invalid.
+    fn collectPoolEvent(self: *EventLoop, event: posix.Kevent, out: *BatchEntry) bool {
+        const idx = event.udata - @as(usize, state.kPoolBase);
+        if (idx >= state.kPoolSize) return false;
+        const ctx = &self.pool[idx];
+        if (!ctx.in_use) return false;
+
+        out.token = ctx.port_id;
+        out.slot_idx = idx;
+
+        switch (ctx.op) {
+            .accept => {
+                const conn = posix.accept(ctx.fd, null, null, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC) catch {
+                    out.kind = .int_val;
+                    out.int_val = -1;
+                    return true;
+                };
+                setTcpNoDelay(conn);
+                out.kind = .int_val;
+                out.int_val = conn;
+                return true;
+            },
+            .recv => {
+                if (ctx.tls_id != 0) {
+                    const tls_id = ctx.tls_id;
+                    const bytes_read = posix.read(ctx.fd, ctx.data.recv.buf[0..]) catch {
+                        out.kind = .null_val;
+                        return true;
+                    };
+                    if (bytes_read == 0) {
+                        out.kind = .null_val;
+                        return true;
+                    }
+                    if (!tls_module.feedRecv(tls_id, ctx.data.recv.buf[0..bytes_read])) {
+                        out.kind = .null_val;
+                        return true;
+                    }
+                    const plain_n = tls_module.readPlaintext(tls_id, ctx.data.recv.buf[0..]);
+                    if (plain_n > 0) {
+                        out.kind = .typed_data;
+                        out.bytes_len = @intCast(plain_n);
+                    } else {
+                        out.kind = .null_val;
+                    }
+                    return true;
+                }
+
+                const bytes_read = posix.read(ctx.fd, ctx.data.recv.buf[0..]) catch {
+                    out.kind = .null_val;
+                    return true;
+                };
+                if (bytes_read == 0) {
+                    out.kind = .null_val;
+                } else {
+                    out.kind = .typed_data;
+                    out.bytes_len = bytes_read;
+                }
+                return true;
+            },
+            .send => {
+                const bytes_written = posix.write(ctx.fd, ctx.data.send.buf[0..ctx.data.send.len]) catch {
+                    out.kind = .int_val;
+                    out.int_val = -1;
+                    return true;
+                };
+                out.kind = .int_val;
+                out.int_val = @intCast(bytes_written);
+                return true;
+            },
+            .tls_handshake => {
+                const tls_id = ctx.tls_id;
+                if (tls_id == 0) {
+                    out.kind = .int_val;
+                    out.int_val = -1;
+                    return true;
+                }
+
+                // `.tls_handshake` has no embedded recv buffer in the tagged union.
+                // Use a stack buffer for sync kqueue reads.
+                var net_buf: [state.kBufSize]u8 = undefined;
+                if (event.filter != EVFILT_WRITE) {
+                    const bytes_read = posix.read(ctx.fd, net_buf[0..]) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            if (!self.armTlsHandshake(idx, ctx.fd, false)) {
+                                out.kind = .int_val;
+                                out.int_val = -1;
+                                tls_module.freeConn(tls_id);
+                                return true;
+                            }
+                            return false;
+                        },
+                        else => {
+                            out.kind = .int_val;
+                            out.int_val = -1;
+                            tls_module.freeConn(tls_id);
+                            return true;
+                        },
+                    };
+                    if (bytes_read == 0) {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        tls_module.freeConn(tls_id);
+                        return true;
+                    }
+                    if (!tls_module.feedRecv(tls_id, net_buf[0..bytes_read])) {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        tls_module.freeConn(tls_id);
+                        return true;
+                    }
+                }
+
+                switch (tls_module.advanceHandshake(tls_id)) {
+                    .done => {
+                        out.kind = .int_val;
+                        out.int_val = tls_id;
+                        return true;
+                    },
+                    .want_read => {
+                        if (!self.armTlsHandshake(idx, ctx.fd, false)) {
+                            out.kind = .int_val;
+                            out.int_val = -1;
+                            tls_module.freeConn(tls_id);
+                            return true;
+                        }
+                        return false;
+                    },
+                    .want_write => {
+                        if (!self.armTlsHandshake(idx, ctx.fd, true)) {
+                            out.kind = .int_val;
+                            out.int_val = -1;
+                            tls_module.freeConn(tls_id);
+                            return true;
+                        }
+                        return false;
+                    },
+                    .err => {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        tls_module.freeConn(tls_id);
+                        return true;
+                    },
+                }
+            },
+        }
+    }
+
+    /// Build one Dart_CObject_kArray with [token0, value0, token1, value1, ...] and post it.
+    /// All pool slots are freed after the post (kTypedData bytes are copied by Dart_PostCObject).
+    fn flushBatch(self: *EventLoop, batch: []BatchEntry) void {
+        var token_objs: [32]engine.Dart_CObject = undefined;
+        var value_objs: [32]engine.Dart_CObject = undefined;
+        var ptrs: [64]?*engine.Dart_CObject = undefined;
+
+        for (batch, 0..) |entry, i| {
+            token_objs[i] = .{ .@"type" = engine.Dart_CObject_kInt64, .value = .{ .as_int64 = entry.token } };
+            value_objs[i] = switch (entry.kind) {
+                .int_val => .{ .@"type" = engine.Dart_CObject_kInt64, .value = .{ .as_int64 = entry.int_val } },
+                .null_val => .{ .@"type" = engine.Dart_CObject_kNull, .value = .{ .as_int64 = 0 } },
+                .typed_data => .{
+                    .@"type" = engine.Dart_CObject_kTypedData,
+                    .value = .{ .as_typed_data = .{
+                        .data_type = engine.Dart_TypedData_kUint8,
+                        .length = @intCast(entry.bytes_len),
+                        .values = self.pool[entry.slot_idx].data.recv.buf[0..entry.bytes_len].ptr,
+                    } },
+                },
+            };
+            ptrs[2 * i] = &token_objs[i];
+            ptrs[2 * i + 1] = &value_objs[i];
+        }
+
+        var batch_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kArray,
+            .value = .{ .as_array = .{
+                .length = @intCast(2 * batch.len),
+                .values = ptrs[0..].ptr,
+            } },
+        };
+        if (profiler.enabled) profiler.p.onFlushBatch();
+        _ = engine.Dart_PostCObject(self.batch_port_id, &batch_obj);
+
+        // Free all slots after posting — kTypedData bytes were copied synchronously.
+        for (batch) |entry| {
+            state.freeSlot(self.pool, &self.slot_alloc, entry.slot_idx);
+        }
+    }
+
+    /// Fallback: post each completion immediately (used before batch port is set up).
     fn dispatchPoolEvent(self: *EventLoop, event: posix.Kevent) void {
         const idx = event.udata - @as(usize, state.kPoolBase);
         if (idx >= state.kPoolSize) return;
@@ -199,13 +437,7 @@ pub const EventLoop = struct {
 
         switch (ctx.op) {
             .accept => {
-                // listen fd is readable: do non-blocking accept
-                const conn = posix.accept(
-                    ctx.fd,
-                    null,
-                    null,
-                    posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
-                ) catch {
+                const conn = posix.accept(ctx.fd, null, null, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC) catch {
                     _ = engine.Dart_PostInteger(ctx.port_id, -1);
                     state.freeSlot(self.pool, &self.slot_alloc, idx);
                     return;
@@ -215,19 +447,37 @@ pub const EventLoop = struct {
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
             },
             .recv => {
-                // conn fd is readable: do non-blocking read into embedded pool buffer.
+                if (ctx.tls_id != 0) {
+                    const tls_id = ctx.tls_id;
+                    const bytes_read = posix.read(ctx.fd, ctx.data.recv.buf[0..]) catch {
+                        state.postRecvResult(ctx.port_id, -1, ctx.data.recv.buf[0..0]);
+                        state.freeSlot(self.pool, &self.slot_alloc, idx);
+                        return;
+                    };
+                    if (bytes_read == 0 or !tls_module.feedRecv(tls_id, ctx.data.recv.buf[0..bytes_read])) {
+                        state.postRecvResult(ctx.port_id, -1, ctx.data.recv.buf[0..0]);
+                        state.freeSlot(self.pool, &self.slot_alloc, idx);
+                        return;
+                    }
+                    const plain_n = tls_module.readPlaintext(tls_id, ctx.data.recv.buf[0..]);
+                    if (plain_n > 0) {
+                        state.postRecvResult(ctx.port_id, plain_n, ctx.data.recv.buf[0..]);
+                    } else {
+                        state.postRecvResult(ctx.port_id, -1, ctx.data.recv.buf[0..0]);
+                    }
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+
                 const bytes_read = posix.read(ctx.fd, ctx.data.recv.buf[0..]) catch {
                     state.postRecvResult(ctx.port_id, -1, ctx.data.recv.buf[0..0]);
                     state.freeSlot(self.pool, &self.slot_alloc, idx);
                     return;
                 };
-                // postRecvResult serializes buf[0..n] into a Dart kTypedData message
-                // (one VM memcpy). The pool slot is freed immediately after — no GC.
                 state.postRecvResult(ctx.port_id, @intCast(bytes_read), ctx.data.recv.buf[0..]);
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
             },
             .send => {
-                // conn fd is writable: retry the write with embedded send buffer.
                 const bytes_written = posix.write(ctx.fd, ctx.data.send.buf[0..ctx.data.send.len]) catch {
                     _ = engine.Dart_PostInteger(ctx.port_id, -1);
                     state.freeSlot(self.pool, &self.slot_alloc, idx);
@@ -235,6 +485,132 @@ pub const EventLoop = struct {
                 };
                 _ = engine.Dart_PostInteger(ctx.port_id, @intCast(bytes_written));
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
+            },
+            .tls_handshake => {
+                const tls_id = ctx.tls_id;
+                if (tls_id == 0) {
+                    _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+
+                var net_buf: [state.kBufSize]u8 = undefined;
+                if (event.filter != EVFILT_WRITE) {
+                    const bytes_read = posix.read(ctx.fd, net_buf[0..]) catch |err| switch (err) {
+                        error.WouldBlock => {
+                            if (!self.armTlsHandshake(idx, ctx.fd, false)) {
+                                _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                                tls_module.freeConn(tls_id);
+                                state.freeSlot(self.pool, &self.slot_alloc, idx);
+                            }
+                            return;
+                        },
+                        else => {
+                            _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                            tls_module.freeConn(tls_id);
+                            state.freeSlot(self.pool, &self.slot_alloc, idx);
+                            return;
+                        },
+                    };
+                    if (bytes_read == 0) {
+                        _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                        tls_module.freeConn(tls_id);
+                        state.freeSlot(self.pool, &self.slot_alloc, idx);
+                        return;
+                    }
+                    if (!tls_module.feedRecv(tls_id, net_buf[0..bytes_read])) {
+                        _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                        tls_module.freeConn(tls_id);
+                        state.freeSlot(self.pool, &self.slot_alloc, idx);
+                        return;
+                    }
+                }
+
+                switch (tls_module.advanceHandshake(tls_id)) {
+                    .done => {
+                        _ = engine.Dart_PostInteger(ctx.port_id, tls_id);
+                        state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    },
+                    .want_read => {
+                        if (!self.armTlsHandshake(idx, ctx.fd, false)) {
+                            _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                            tls_module.freeConn(tls_id);
+                            state.freeSlot(self.pool, &self.slot_alloc, idx);
+                        }
+                    },
+                    .want_write => {
+                        if (!self.armTlsHandshake(idx, ctx.fd, true)) {
+                            _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                            tls_module.freeConn(tls_id);
+                            state.freeSlot(self.pool, &self.slot_alloc, idx);
+                        }
+                    },
+                    .err => {
+                        _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                        tls_module.freeConn(tls_id);
+                        state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    },
+                }
+            },
+        }
+    }
+
+    fn postSingleCompletion(
+        self: *EventLoop,
+        token: engine.Dart_Port,
+        slot_idx: usize,
+        kind: BatchKind,
+        int_val: i64,
+        bytes_len: usize,
+    ) void {
+        if (self.batch_port_id != 0) {
+            var token_obj = engine.Dart_CObject{
+                .@"type" = engine.Dart_CObject_kInt64,
+                .value = .{ .as_int64 = token },
+            };
+            var value_obj = switch (kind) {
+                .int_val => engine.Dart_CObject{
+                    .@"type" = engine.Dart_CObject_kInt64,
+                    .value = .{ .as_int64 = int_val },
+                },
+                .null_val => engine.Dart_CObject{
+                    .@"type" = engine.Dart_CObject_kNull,
+                    .value = .{ .as_int64 = 0 },
+                },
+                .typed_data => engine.Dart_CObject{
+                    .@"type" = engine.Dart_CObject_kTypedData,
+                    .value = .{ .as_typed_data = .{
+                        .data_type = engine.Dart_TypedData_kUint8,
+                        .length = @intCast(bytes_len),
+                        .values = self.pool[slot_idx].data.recv.buf[0..bytes_len].ptr,
+                    } },
+                },
+            };
+            var ptrs = [2]?*engine.Dart_CObject{ &token_obj, &value_obj };
+            var obj = engine.Dart_CObject{
+                .@"type" = engine.Dart_CObject_kArray,
+                .value = .{ .as_array = .{
+                    .length = 2,
+                    .values = ptrs[0..].ptr,
+                } },
+            };
+            _ = engine.Dart_PostCObject(self.batch_port_id, &obj);
+            return;
+        }
+
+        switch (kind) {
+            .int_val => {
+                _ = engine.Dart_PostInteger(token, int_val);
+            },
+            .null_val => {
+                state.postRecvResult(token, -1, self.pool[slot_idx].data.recv.buf[0..0]);
+            },
+            .typed_data => {
+                state.postRecvResult(
+                    token,
+                    @intCast(bytes_len),
+                    self.pool[slot_idx].data.recv.buf[0..bytes_len],
+                );
             },
         }
     }
@@ -290,7 +666,7 @@ fn submitAccept(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
         udata,
     )) {
         const ctx = &self.pool[slot_idx];
-        _ = engine.Dart_PostInteger(ctx.port_id, -1);
+        self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     }
 }
@@ -306,7 +682,7 @@ fn submitRecv(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
         udata,
     )) {
         const ctx = &self.pool[slot_idx];
-        state.postRecvResult(ctx.port_id, -1, ctx.data.recv.buf[0..0]);
+        self.postSingleCompletion(ctx.port_id, slot_idx, .null_val, 0, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     }
 }
@@ -327,17 +703,17 @@ fn submitSend(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t, buf: []u8) void
                 @as(u16, c.EV.ADD | c.EV.ENABLE | c.EV.ONESHOT),
                 udata,
             )) {
-                _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
                 state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
             }
         } else {
-            _ = engine.Dart_PostInteger(ctx.port_id, -1);
+            self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
             state.freeSlot(self.pool, &self.slot_alloc, slot_idx); // buf is embedded, no heap free
         }
         return;
     };
     // Write completed immediately — post result and free the slot.
-    _ = engine.Dart_PostInteger(ctx.port_id, @intCast(bytes_written));
+    self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, @intCast(bytes_written), 0);
     state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
 }
 

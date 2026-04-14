@@ -4,7 +4,8 @@
 
 // ignore_for_file: camel_case_types
 
-import 'dart:isolate' show SendPort;
+import 'dart:async' show Completer;
+import 'dart:isolate' show RawReceivePort, SendPort;
 import 'dart:typed_data' show Uint8List;
 
 // ---------------------------------------------------------------------------
@@ -53,3 +54,125 @@ external void zigIoTcpWriteBytes(int connFd, Uint8List bytes, SendPort sendPort)
 /// Close a file descriptor.
 @pragma('vm:external-name', 'ZigIo_Close')
 external void zigIoClose(int fd);
+
+// ---------------------------------------------------------------------------
+// Batch dispatcher (Phase 14) — one RawReceivePort, token map, one kArray
+// message per kevent() batch instead of N individual messages.
+// ---------------------------------------------------------------------------
+
+
+@pragma('vm:external-name', 'ZigIo_SetBatchPort')
+external void _zigIoSetBatchPort(SendPort port);
+
+@pragma('vm:external-name', 'ZigIo_TcpAcceptToken')
+external void _zigIoTcpAcceptToken(int listenFd, int token);
+
+@pragma('vm:external-name', 'ZigIo_TcpReadToken')
+external void _zigIoTcpReadToken(int connFd, int maxBytes, int token);
+
+@pragma('vm:external-name', 'ZigIo_TcpWriteBytesToken')
+external void _zigIoTcpWriteBytesToken(int connFd, Uint8List bytes, int token);
+
+/// Per-isolate batch dispatcher. Initialised lazily on first token I/O call.
+/// All completions from one kevent() batch arrive in one List message,
+/// reducing DartEngine_HandleMessage call count from N to 1.
+/// Exported so that zig_tls.dart can reuse the same batch port.
+late final _dispatcher = _ZigIoDispatcher();
+
+// Package-accessible alias used by zig_tls.dart.
+// ignore: library_private_types_in_public_api
+_ZigIoDispatcher get zigIoDispatcher => _dispatcher;
+
+class _ZigIoDispatcher {
+  final RawReceivePort _port = RawReceivePort();
+  final Map<int, Completer<Object?>> _pending = {};
+  int _counter = 0;
+
+  _ZigIoDispatcher() {
+    _port.handler = _onBatch;
+    _zigIoSetBatchPort(_port.sendPort);
+  }
+
+  void _onBatch(Object? msg) {
+    final batch = msg as List<Object?>;
+    for (int i = 0; i < batch.length; i += 2) {
+      final token = batch[i] as int;
+      _pending.remove(token)?.complete(batch[i + 1]);
+    }
+  }
+
+  Future<T> submit<T>(void Function(int token) fn) {
+    final token = ++_counter;
+    final c = Completer<T>();
+    _pending[token] = c as Completer<Object?>;
+    fn(token);
+    return c.future;
+  }
+}
+
+/// Accept a connection. Returns connFd.
+Future<int> zigIoTcpAcceptFuture(int listenFd) =>
+    _dispatcher.submit<int>((t) => _zigIoTcpAcceptToken(listenFd, t));
+
+/// Read up to [maxBytes] from [connFd]. Returns null on EOF/error.
+Future<Uint8List?> zigIoTcpReadFuture(int connFd, int maxBytes) =>
+    _dispatcher
+        .submit<Uint8List?>((t) => _zigIoTcpReadToken(connFd, maxBytes, t))
+        .then((v) => v as Uint8List?);
+
+/// Write [bytes] to [connFd]. Returns bytes written, or -1 on error.
+Future<int> zigIoTcpWriteBytesFuture(int connFd, Uint8List bytes) =>
+    _dispatcher
+        .submit<int>((t) => _zigIoTcpWriteBytesToken(connFd, bytes, t))
+        .then((v) => (v as int?) ?? -1);
+
+// ---------------------------------------------------------------------------
+// Per-connection fast path (Phase 11 style) — single RawReceivePort reused
+// for all reads/writes on one connection. Uses Dart_PostInteger directly,
+// bypassing the batch dispatcher's HashMap lookup overhead.
+// ---------------------------------------------------------------------------
+
+/// One-shot accept. Creates a temporary port, fires once, then closes it.
+Future<int> zigIoAcceptFuture(int listenFd) {
+  final c = Completer<int>();
+  final p = RawReceivePort();
+  p.handler = (Object? msg) {
+    p.close();
+    c.complete((msg as int?) ?? -1);
+  };
+  zigIoTcpAccept(listenFd, p.sendPort);
+  return c.future;
+}
+
+/// Per-connection wrapper. One [RawReceivePort] is created at construction
+/// and reused for every read and write, avoiding per-op port allocation.
+class ZigConn {
+  final int fd;
+  final RawReceivePort _port;
+  Completer<Object?>? _pending;
+
+  ZigConn(this.fd) : _port = RawReceivePort() {
+    _port.handler = (Object? msg) {
+      final c = _pending!;
+      _pending = null;
+      c.complete(msg);
+    };
+  }
+
+  Future<Uint8List?> read(int maxBytes) {
+    _pending = Completer<Object?>();
+    zigIoTcpRead(fd, maxBytes, _port.sendPort);
+    return _pending!.future.then((v) => v as Uint8List?);
+  }
+
+  Future<int> writeBytes(Uint8List bytes) {
+    _pending = Completer<Object?>();
+    zigIoTcpWriteBytes(fd, bytes, _port.sendPort);
+    return _pending!.future.then((v) => (v as int?) ?? -1);
+  }
+
+  void close() {
+    zigIoClose(fd);
+    _port.close();
+  }
+}
