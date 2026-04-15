@@ -229,6 +229,18 @@ pub const EventLoop = struct {
         bytes_len: usize = 0,
     };
 
+    /// Re-arm a serve slot for EVFILT_READ (incomplete request — need more data).
+    fn armServeRecv(self: *EventLoop, idx: usize, fd: posix.fd_t) bool {
+        const udata = @as(usize, state.kPoolBase) + idx;
+        return addKevent(
+            self.kq,
+            @intCast(fd),
+            @as(i16, c.EVFILT.READ),
+            @as(u16, c.EV.ADD | c.EV.ENABLE | c.EV.ONESHOT),
+            udata,
+        );
+    }
+
     /// Re-arm a serve slot for EVFILT_WRITE (partial write remainder path).
     fn armServeWrite(self: *EventLoop, idx: usize, fd: posix.fd_t) bool {
         const udata = @as(usize, state.kPoolBase) + idx;
@@ -333,8 +345,16 @@ pub const EventLoop = struct {
             .serve => {
                 const sd = &ctx.data.serve;
                 if (!sd.write_phase) {
-                    // Phase 1: recv fired — read, route, write inline.
-                    const bytes_read = posix.read(ctx.fd, sd.recv_buf[0..]) catch {
+                    // Phase 1: recv fired — append to buffer, route, write inline.
+                    const space = sd.recv_buf[sd.recv_len..];
+                    if (space.len == 0) {
+                        // Buffer full without a complete request — send 400.
+                        _ = posix.write(ctx.fd, http_responses.bad_request) catch {};
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    }
+                    const bytes_read = posix.read(ctx.fd, space) catch {
                         out.kind = .int_val;
                         out.int_val = -1;
                         return true;
@@ -344,10 +364,19 @@ pub const EventLoop = struct {
                         out.int_val = -1; // EOF
                         return true;
                     }
-                    const route = http_parser.routeRequest(sd.recv_buf[0..bytes_read]);
+                    sd.recv_len += bytes_read;
+                    const route = http_parser.routeRequest(sd.recv_buf[0..sd.recv_len]);
+                    if (route == http_parser.RouteId.incomplete) {
+                        // Need more data — re-arm EVFILT_READ and keep accumulating.
+                        if (!self.armServeRecv(idx, ctx.fd)) {
+                            out.kind = .int_val;
+                            out.int_val = -1;
+                            return true;
+                        }
+                        return false;
+                    }
                     sd.should_close = http_responses.shouldClose(route);
                     const resp = http_responses.forRoute(route) orelse {
-                        // eof or unknown — close without sending
                         out.kind = .int_val;
                         out.int_val = -1;
                         return true;
@@ -359,7 +388,6 @@ pub const EventLoop = struct {
                         return true;
                     };
                     if (n >= resp.len) {
-                        // Full write done — complete the serve op.
                         out.kind = .int_val;
                         out.int_val = if (sd.should_close) -1 else 0;
                         return true;
@@ -590,19 +618,21 @@ pub const EventLoop = struct {
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
             },
             .serve => {
-                // Legacy path: full synchronous serve — read, route, write.
+                // Legacy path: synchronous serve with blocking read loop for incomplete requests.
                 const sd = &ctx.data.serve;
-                const bytes_read = posix.read(ctx.fd, sd.recv_buf[0..]) catch {
-                    _ = engine.Dart_PostInteger(ctx.port_id, -1);
-                    state.freeSlot(self.pool, &self.slot_alloc, idx);
-                    return;
+                // Read loop: accumulate until complete or EOF.
+                const route = blk: {
+                    while (true) {
+                        const space = sd.recv_buf[sd.recv_len..];
+                        if (space.len == 0) break :blk http_parser.RouteId.bad_request;
+                        const n = posix.read(ctx.fd, space) catch break :blk http_parser.RouteId.eof;
+                        if (n == 0) break :blk http_parser.RouteId.eof;
+                        sd.recv_len += n;
+                        const r = http_parser.routeRequest(sd.recv_buf[0..sd.recv_len]);
+                        if (r != http_parser.RouteId.incomplete) break :blk r;
+                        // incomplete — loop to read more
+                    }
                 };
-                if (bytes_read == 0) {
-                    _ = engine.Dart_PostInteger(ctx.port_id, -1);
-                    state.freeSlot(self.pool, &self.slot_alloc, idx);
-                    return;
-                }
-                const route = http_parser.routeRequest(sd.recv_buf[0..bytes_read]);
                 const close = http_responses.shouldClose(route);
                 if (http_responses.forRoute(route)) |resp| {
                     var written: usize = 0;

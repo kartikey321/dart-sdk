@@ -4,6 +4,7 @@ const engine = @import("../../engine.zig");
 const state = @import("../state.zig");
 const profiler = @import("../../profiler.zig");
 const http_parser = @import("../../http/parser.zig");
+const http_responses = @import("../../http/responses.zig");
 
 /// ZigIo_TcpBind(host: String, port: int, backlog: int) → int (fd or -errno)
 /// Synchronous: creates, binds, and listens a TCP socket. Returns fd on success.
@@ -181,6 +182,9 @@ pub fn ZigIo_TcpServeToken(args: engine.Dart_NativeArguments) callconv(.c) void 
 
     const loop = state.current_loop orelse return;
     const idx = state.allocSlot(loop.pool, loop.slot_alloc) orelse {
+        // Pool exhausted (>4096 concurrent connections) — send 503 and signal close.
+        // Explicit 503 rather than silent drop so the client gets a proper HTTP error.
+        _ = posix.write(@intCast(fd_val), http_responses.service_unavailable) catch {};
         postTokenInt(loop, token, -1);
         return;
     };

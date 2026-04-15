@@ -1,5 +1,31 @@
 # dart-zig Changelog
 
+---
+
+## PERF-5 — Correctness: partial read accumulation + pool exhaustion 503 (2026-04-15)
+
+**Problems fixed:**
+
+1. **Partial HTTP read (false 400):** `routeRequest()` previously mapped `incomplete` → `bad_request`.
+   Slow or segmented clients got a false 400. Now `incomplete` returns `RouteId.incomplete = -4`
+   and the serve op re-arms recv (kqueue: EVFILT_READ re-arm; io_uring: resubmit read SQE into
+   remaining buffer space) until the full request arrives or the 8KB buffer fills.
+
+2. **Pool exhaustion silent drop:** When all 4096 slots are in use, `ZigIo_TcpServeToken` used to
+   post `-1` which looked like EOF. Now: sends a synchronous `503 Service Unavailable` response
+   (no slot needed) then signals close — client gets a proper HTTP error instead of a hang.
+
+**Changes:**
+- `parser.zig`: `routeRequest()` returns `RouteId.incomplete = -4` for `status == .incomplete`
+- `responses.zig`: added `service_unavailable` comptime slice
+- `state.zig`: `ServeData` gains `recv_len: usize = 0`
+- `kqueue.zig`: batch + legacy paths accumulate into `recv_buf[recv_len..]`; new `armServeRecv()`
+- `io_uring.zig`: resubmits read SQE into remaining buffer on incomplete
+- `tcp.zig`: pool-exhausted path sends 503 synchronously
+- `zig_http.dart`: `RouteId.incomplete = -4` synced
+
+---
+
 Phase-by-phase development log. Benchmarks run with `wrk -t4 -c128 -d10s` unless noted.
 
 ---

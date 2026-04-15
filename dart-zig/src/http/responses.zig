@@ -37,6 +37,15 @@ pub const bad_request: []const u8 =
     "\r\n" ++
     "Bad Request";
 
+/// Sent synchronously when the completion pool is exhausted (>4096 concurrent conns).
+pub const service_unavailable: []const u8 =
+    "HTTP/1.1 503 Service Unavailable\r\n" ++
+    "Content-Type: text/plain; charset=utf-8\r\n" ++
+    "Content-Length: 19\r\n" ++
+    "Connection: close\r\n" ++
+    "\r\n" ++
+    "Service Unavailable";
+
 /// Return the response slice for a RouteId.
 /// Returns null only for eof/hard-error (connection dead — nothing to send).
 pub fn forRoute(route_id: i64) ?[]const u8 {

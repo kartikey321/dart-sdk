@@ -126,14 +126,18 @@ pub const RouteId = struct {
     pub const hello:       i64 = 0;  // GET /  or  GET /index.html
     pub const ping:        i64 = 1;  // GET /ping
     pub const not_found:   i64 = -1; // valid request, unknown path
-    pub const bad_request: i64 = -2; // malformed or incomplete
-    pub const eof:         i64 = -3; // connection closed or read error (recv_route only)
+    pub const bad_request: i64 = -2; // malformed request (invalid syntax)
+    pub const eof:         i64 = -3; // connection closed or read error
+    pub const incomplete:  i64 = -4; // need more data (serve op re-arms recv)
 };
 
 /// Parse the request in `buf` and return a RouteId integer.
+/// Returns incomplete (-4) when more data is needed — callers should buffer and retry.
+/// Returns bad_request (-2) only for definitively malformed requests.
 /// Zero allocations — only stack memory used.
 pub fn routeRequest(buf: []const u8) i64 {
     const r = parse(buf);
+    if (r.status == .incomplete) return RouteId.incomplete;
     if (r.status != .complete) return RouteId.bad_request;
     const path = r.path;
     if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {

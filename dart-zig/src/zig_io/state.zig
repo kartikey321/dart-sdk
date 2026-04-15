@@ -51,6 +51,8 @@ pub const CompletionCtx = struct {
     };
     pub const ServeData = struct {
         recv_buf: [kBufSize]u8 = undefined,
+        /// Bytes accumulated so far in recv_buf (for multi-read request assembly).
+        recv_len: usize = 0,
         /// Points into http/responses.zig comptime slices — no heap alloc.
         write_ptr: [*]const u8 = undefined,
         write_len: usize = 0,

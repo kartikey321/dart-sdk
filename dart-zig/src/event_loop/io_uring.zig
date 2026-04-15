@@ -290,13 +290,31 @@ pub const EventLoop = struct {
                 const sd = &ctx.data.serve;
                 const user_data = cqe.user_data; // slot index encoded; reuse for write SQE
                 if (!sd.write_phase) {
-                    // Phase 1: recv SQE completed — route and write inline.
+                    // Phase 1: recv SQE completed — accumulate, route, write inline.
                     if (cqe.res <= 0) {
                         out.kind = .int_val;
                         out.int_val = -1;
                         return true;
                     }
-                    const route = http_parser.routeRequest(ctx.data.serve.recv_buf[0..@intCast(cqe.res)]);
+                    sd.recv_len += @intCast(cqe.res);
+                    const route = http_parser.routeRequest(ctx.data.serve.recv_buf[0..sd.recv_len]);
+                    if (route == http_parser.RouteId.incomplete) {
+                        // Need more data — resubmit recv SQE into remaining buffer space.
+                        const space = sd.recv_buf[sd.recv_len..];
+                        if (space.len == 0) {
+                            // Buffer full — send 400.
+                            _ = posix.write(ctx.fd, http_responses.bad_request) catch {};
+                            out.kind = .int_val;
+                            out.int_val = -1;
+                            return true;
+                        }
+                        _ = self.ring.read(user_data, ctx.fd, .{ .buffer = space }, 0) catch {
+                            out.kind = .int_val;
+                            out.int_val = -1;
+                            return true;
+                        };
+                        return false; // wait for next recv
+                    }
                     sd.should_close = http_responses.shouldClose(route);
                     const resp = http_responses.forRoute(route) orelse {
                         out.kind = .int_val;
@@ -566,14 +584,31 @@ pub const EventLoop = struct {
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
             },
             .serve => {
-                // Legacy path: synchronous serve — route then blocking write loop.
+                // Legacy path: accumulate recv then synchronous blocking write.
                 const sd = &ctx.data.serve;
                 if (cqe.res <= 0) {
                     _ = engine.Dart_PostInteger(ctx.port_id, -1);
                     state.freeSlot(self.pool, &self.slot_alloc, idx);
                     return;
                 }
-                const route = http_parser.routeRequest(sd.recv_buf[0..@intCast(cqe.res)]);
+                sd.recv_len += @intCast(cqe.res);
+                const route = http_parser.routeRequest(sd.recv_buf[0..sd.recv_len]);
+                // In the legacy path, resubmit recv synchronously for incomplete.
+                if (route == http_parser.RouteId.incomplete) {
+                    const space = sd.recv_buf[sd.recv_len..];
+                    if (space.len > 0) {
+                        _ = self.ring.read(
+                            state.kPoolBase + @as(u64, idx),
+                            ctx.fd,
+                            .{ .buffer = space },
+                            0,
+                        ) catch {};
+                    } else {
+                        _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                        state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    }
+                    return;
+                }
                 const close = http_responses.shouldClose(route);
                 if (http_responses.forRoute(route)) |resp| {
                     var written: usize = 0;
