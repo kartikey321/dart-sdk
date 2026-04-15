@@ -38,12 +38,12 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addLibraryPath(b.path("boringssl-build"));
     exe.root_module.linkSystemLibrary("ssl", .{});
     exe.root_module.linkSystemLibrary("crypto", .{});
-    exe.linkLibCpp(); // BoringSSL is C++ internally
+    exe.root_module.linkSystemLibrary("c++", .{}); // BoringSSL is C++ internally
 
     if (builtin.os.tag == .linux) {
         // pthread_create is a weak symbol in glibc — must explicitly link pthreads
         // so libdart_engine_jit_shared.so sees a non-null pthread_create at startup.
-        exe.linkLibC();
+        exe.root_module.linkLibC();
         exe.root_module.linkSystemLibrary("pthread", .{});
     } else if (builtin.os.tag == .macos) {
         exe.root_module.linkFramework("CoreFoundation", .{});
