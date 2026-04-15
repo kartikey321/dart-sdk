@@ -14,7 +14,7 @@ pub const kPoolBase: u64 = 16;
 /// 4096 slots × 8 KB = 32 MB total — stays resident in L3 cache.
 pub const kBufSize: usize = 8192;
 
-pub const Op = enum(u8) { accept, recv, recv_route, serve, send, tls_handshake };
+pub const Op = enum(u8) { accept, recv, recv_route, serve, loop, send, tls_handshake };
 
 pub const CompletionCtx = struct {
     in_use: bool = false,
@@ -39,6 +39,10 @@ pub const CompletionCtx = struct {
         /// Phase 2 (write_phase=true): write static response remainder via SQE/kevent.
         /// Posts 0 (keep-alive) or -1 (close) to Dart — one await per request.
         serve: ServeData,
+        /// Keep-alive connection loop: handles the entire connection lifetime in Zig.
+        /// recv → route → write → memmove → loop (pipelining), repeat.
+        /// Only posts to Dart on close/error — one await per connection, zero per request.
+        loop: ServeData,
         /// Pre-allocated send buffer embedded in the slot.
         /// Filled by ZigIo_TcpWriteBytes via @memcpy from Dart Uint8List.
         send: SendData,
@@ -60,6 +64,10 @@ pub const CompletionCtx = struct {
         write_phase: bool = false,
         /// Set after routing: close connection after write completes.
         should_close: bool = false,
+        /// Bytes consumed by the current request (body_offset of the request
+        /// being written). Used by Op.loop to memmove past the request after
+        /// a partial write completes.
+        pending_consumed: usize = 0,
     };
     pub const SendData = struct {
         buf: [kBufSize]u8 = undefined,
@@ -76,6 +84,8 @@ pub const LoopOps = struct {
     submit_recv_route: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
     /// Fused read+route+write — arms a recv; completion handler routes and writes inline.
     submit_serve: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
+    /// Keep-alive connection loop — entire connection lifecycle in Zig; posts only on close.
+    submit_loop: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
     submit_send: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t, buf: []u8) void,
 };
 

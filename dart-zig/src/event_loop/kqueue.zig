@@ -253,6 +253,49 @@ pub const EventLoop = struct {
         );
     }
 
+    /// Process the pipelining inner loop for an Op.loop slot.
+    /// Tries to route recv_buf[0..recv_len]; writes response inline; memmoves past
+    /// consumed bytes; loops until buffer empty or partial write.
+    /// Returns null if the slot was re-armed (no post to Dart needed).
+    /// Returns an i64 if the connection should be closed (post this value to Dart).
+    fn processLoopPipeline(self: *EventLoop, idx: usize) ?i64 {
+        const ctx = &self.pool[idx];
+        const sd = &ctx.data.loop;
+        while (true) {
+            const rr = http_parser.routeRequestFull(sd.recv_buf[0..sd.recv_len]);
+            if (rr.route == http_parser.RouteId.incomplete) {
+                if (!self.armServeRecv(idx, ctx.fd)) return -1;
+                return null;
+            }
+            const resp = http_responses.forRoute(rr.route) orelse return -1;
+            const close = http_responses.shouldClose(rr.route);
+            const n = posix.write(ctx.fd, resp) catch return -1;
+            if (n < resp.len) {
+                // Partial write — arm EVFILT_WRITE for remainder.
+                sd.write_ptr = resp.ptr + n;
+                sd.write_len = resp.len - n;
+                sd.write_phase = true;
+                sd.should_close = close;
+                sd.pending_consumed = rr.consumed;
+                if (!self.armServeWrite(idx, ctx.fd)) return -1;
+                return null;
+            }
+            if (close) return -1;
+            // Advance buffer past consumed request.
+            const remaining = sd.recv_len - rr.consumed;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, sd.recv_buf[0..remaining], sd.recv_buf[rr.consumed..sd.recv_len]);
+            }
+            sd.recv_len = remaining;
+            if (remaining == 0) {
+                // Buffer empty — re-arm for next request.
+                if (!self.armServeRecv(idx, ctx.fd)) return -1;
+                return null;
+            }
+            // Pipelined request — loop immediately.
+        }
+    }
+
     fn armTlsHandshake(self: *EventLoop, idx: usize, fd: posix.fd_t, wait_write: bool) bool {
         const filter: i16 = if (wait_write) EVFILT_WRITE else @as(i16, c.EVFILT.READ);
         const udata = @as(usize, state.kPoolBase) + idx;
@@ -424,6 +467,67 @@ pub const EventLoop = struct {
                     }
                     return false;
                 }
+            },
+            .loop => {
+                const sd = &ctx.data.loop;
+                if (!sd.write_phase) {
+                    // Recv phase: read into remaining buffer space.
+                    const space = sd.recv_buf[sd.recv_len..];
+                    if (space.len == 0) {
+                        _ = posix.write(ctx.fd, http_responses.bad_request) catch {};
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    }
+                    const bytes_read = posix.read(ctx.fd, space) catch {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    };
+                    if (bytes_read == 0) {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    }
+                    sd.recv_len += bytes_read;
+                } else {
+                    // Write phase: complete partial write remainder.
+                    const n = posix.write(ctx.fd, sd.write_ptr[0..sd.write_len]) catch {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    };
+                    if (n < sd.write_len) {
+                        sd.write_ptr += n;
+                        sd.write_len -= n;
+                        if (!self.armServeWrite(idx, ctx.fd)) {
+                            out.kind = .int_val;
+                            out.int_val = -1;
+                            return true;
+                        }
+                        return false;
+                    }
+                    // Write complete.
+                    if (sd.should_close) {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    }
+                    sd.write_phase = false;
+                    // Advance buffer past the request that was just served.
+                    const remaining = sd.recv_len - sd.pending_consumed;
+                    if (remaining > 0) {
+                        std.mem.copyForwards(u8, sd.recv_buf[0..remaining], sd.recv_buf[sd.pending_consumed..sd.recv_len]);
+                    }
+                    sd.recv_len = remaining;
+                }
+                // Run pipelining loop.
+                if (self.processLoopPipeline(idx)) |val| {
+                    out.kind = .int_val;
+                    out.int_val = val;
+                    return true;
+                }
+                return false;
             },
             .send => {
                 const bytes_written = posix.write(ctx.fd, ctx.data.send.buf[0..ctx.data.send.len]) catch {
@@ -645,6 +749,46 @@ pub const EventLoop = struct {
                 _ = engine.Dart_PostInteger(ctx.port_id, if (close) -1 else 0);
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
             },
+            .loop => {
+                // Legacy path: synchronous keep-alive loop until connection closes.
+                const sd = &ctx.data.loop;
+                while (true) {
+                    // Read one batch of data.
+                    const space = sd.recv_buf[sd.recv_len..];
+                    if (space.len == 0) break; // buffer overflow — close
+                    const n = posix.read(ctx.fd, space) catch break;
+                    if (n == 0) break; // EOF
+                    sd.recv_len += n;
+                    // Pipeline: serve all complete requests in recv_buf.
+                    while (true) {
+                        const rr = http_parser.routeRequestFull(sd.recv_buf[0..sd.recv_len]);
+                        if (rr.route == http_parser.RouteId.incomplete) break; // need more data
+                        const close = http_responses.shouldClose(rr.route);
+                        if (http_responses.forRoute(rr.route)) |resp| {
+                            var written: usize = 0;
+                            while (written < resp.len) {
+                                const w = posix.write(ctx.fd, resp[written..]) catch break;
+                                if (w == 0) break;
+                                written += w;
+                            }
+                        }
+                        if (close) {
+                            _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                            state.freeSlot(self.pool, &self.slot_alloc, idx);
+                            return;
+                        }
+                        // Advance past consumed request.
+                        const remaining = sd.recv_len - rr.consumed;
+                        if (remaining > 0) {
+                            std.mem.copyForwards(u8, sd.recv_buf[0..remaining], sd.recv_buf[rr.consumed..sd.recv_len]);
+                        }
+                        sd.recv_len = remaining;
+                        if (remaining == 0) break; // buffer empty — read more
+                    }
+                }
+                _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                state.freeSlot(self.pool, &self.slot_alloc, idx);
+            },
             .send => {
                 const bytes_written = posix.write(ctx.fd, ctx.data.send.buf[0..ctx.data.send.len]) catch {
                     _ = engine.Dart_PostInteger(ctx.port_id, -1);
@@ -808,6 +952,7 @@ const kqueue_ops = state.LoopOps{
     .submit_recv = submitRecv,
     .submit_recv_route = submitRecv, // same kevent registration; op field distinguishes dispatch
     .submit_serve = submitServe,
+    .submit_loop = submitLoop,
     .submit_send = submitSend,
 };
 
@@ -859,6 +1004,23 @@ fn submitRecv(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
 
 /// Arm EVFILT_READ for a serve slot — completion handler does read+route+write.
 fn submitServe(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
+    const self: *EventLoop = @ptrCast(@alignCast(loop));
+    const udata = @as(usize, state.kPoolBase) + slot_idx;
+    if (!addKevent(
+        self.kq,
+        @intCast(fd),
+        @as(i16, c.EVFILT.READ),
+        @as(u16, c.EV.ADD | c.EV.ENABLE | c.EV.ONESHOT),
+        udata,
+    )) {
+        const ctx = &self.pool[slot_idx];
+        self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
+        state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
+    }
+}
+
+/// Arm EVFILT_READ for a loop slot — completion handler handles entire keep-alive connection.
+fn submitLoop(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
     const self: *EventLoop = @ptrCast(@alignCast(loop));
     const udata = @as(usize, state.kPoolBase) + slot_idx;
     if (!addKevent(

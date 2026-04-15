@@ -129,6 +129,11 @@ pub const EventLoop = struct {
         self.armTimeout() catch return;
 
         var cqes: [32]linux.io_uring_cqe = undefined;
+        // Counts consecutive event-loop iterations where pool I/O fired but no
+        // Dart messages were posted (Op.loop keeps connections alive without Dart
+        // involvement). Used to give the JIT compiler periodic safepoints so its
+        // background threads can install compiled code on single-core-pinned VMs.
+        var jit_idle_iters: u32 = 0;
         while (true) {
             _ = self.ring.submit_and_wait(1) catch break;
 
@@ -221,7 +226,20 @@ pub const EventLoop = struct {
                 // Dart_PostCObject copies kTypedData bytes synchronously → safe to free
                 // slots after. Mirrors kqueue's per-kevent() flushBatch call.
                 if (batch_n > 0) {
+                    jit_idle_iters = 0;
                     self.flushBatch(batch[0..batch_n]);
+                } else if (any_io) {
+                    // Pool I/O fired but no Dart messages were posted (e.g. Op.loop
+                    // re-armed itself without completing to Dart). On single-core-pinned
+                    // processes the JIT compiler background threads never get cooperative
+                    // CPU time. Give them a safepoint every 64 iterations so the JIT can
+                    // install compiled code and avoid priority inversion.
+                    jit_idle_iters += 1;
+                    if (jit_idle_iters >= 128 and self.isolate != null) {
+                        jit_idle_iters = 0;
+                        engine.DartEngine_AcquireIsolate(self.isolate);
+                        engine.DartEngine_ReleaseIsolate();
+                    }
                 }
             }
         }
@@ -366,6 +384,56 @@ pub const EventLoop = struct {
                     out.int_val = if (sd.should_close) -1 else 0;
                     return true;
                 }
+            },
+            .loop => {
+                const sd = &ctx.data.loop;
+                const user_data = cqe.user_data;
+                if (!sd.write_phase) {
+                    // Recv SQE completed — accumulate and run pipeline loop.
+                    if (cqe.res <= 0) {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    }
+                    sd.recv_len += @intCast(cqe.res);
+                } else {
+                    // Write SQE completed — advance buffer, clear write_phase.
+                    if (cqe.res <= 0) {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    }
+                    const written: usize = @intCast(cqe.res);
+                    if (written < sd.write_len) {
+                        // Still partial — resubmit write SQE.
+                        sd.write_ptr += written;
+                        sd.write_len -= written;
+                        _ = self.ring.write(user_data, ctx.fd, sd.write_ptr[0..sd.write_len], 0) catch {
+                            out.kind = .int_val;
+                            out.int_val = -1;
+                            return true;
+                        };
+                        return false;
+                    }
+                    if (sd.should_close) {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    }
+                    sd.write_phase = false;
+                    const remaining = sd.recv_len - sd.pending_consumed;
+                    if (remaining > 0) {
+                        std.mem.copyForwards(u8, sd.recv_buf[0..remaining], sd.recv_buf[sd.pending_consumed..sd.recv_len]);
+                    }
+                    sd.recv_len = remaining;
+                }
+                // Run pipelining loop.
+                if (self.processLoopPipeline(idx)) |val| {
+                    out.kind = .int_val;
+                    out.int_val = val;
+                    return true;
+                }
+                return false;
             },
             .send => {
                 // cqe.res is bytes sent (>=0) or -errno.
@@ -548,6 +616,52 @@ pub const EventLoop = struct {
         }
     }
 
+    /// Process the pipelining inner loop for an Op.loop slot (io_uring path).
+    /// Returns null if the slot was re-armed (SQE submitted, no Dart post).
+    /// Returns i64 if the connection should close (post this value to Dart).
+    fn processLoopPipeline(self: *EventLoop, idx: usize) ?i64 {
+        const ctx = &self.pool[idx];
+        const sd = &ctx.data.loop;
+        const user_data: u64 = state.kPoolBase + @as(u64, idx);
+        while (true) {
+            const rr = http_parser.routeRequestFull(sd.recv_buf[0..sd.recv_len]);
+            if (rr.route == http_parser.RouteId.incomplete) {
+                // Need more data — resubmit recv SQE into remaining buffer space.
+                const space = sd.recv_buf[sd.recv_len..];
+                if (space.len == 0) return -1; // buffer full — close
+                _ = self.ring.read(user_data, ctx.fd, .{ .buffer = space }, 0) catch return -1;
+                return null;
+            }
+            const resp = http_responses.forRoute(rr.route) orelse return -1;
+            const close = http_responses.shouldClose(rr.route);
+            // Inline posix.write fast-path.
+            const n = posix.write(ctx.fd, resp) catch return -1;
+            if (n < resp.len) {
+                // Partial write — submit write SQE for remainder.
+                sd.write_ptr = resp.ptr + n;
+                sd.write_len = resp.len - n;
+                sd.write_phase = true;
+                sd.should_close = close;
+                sd.pending_consumed = rr.consumed;
+                _ = self.ring.write(user_data, ctx.fd, sd.write_ptr[0..sd.write_len], 0) catch return -1;
+                return null;
+            }
+            if (close) return -1;
+            // Advance buffer past consumed request.
+            const remaining = sd.recv_len - rr.consumed;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, sd.recv_buf[0..remaining], sd.recv_buf[rr.consumed..sd.recv_len]);
+            }
+            sd.recv_len = remaining;
+            if (remaining == 0) {
+                // Buffer empty — resubmit recv for next request.
+                _ = self.ring.read(user_data, ctx.fd, .{ .buffer = sd.recv_buf[0..] }, 0) catch return -1;
+                return null;
+            }
+            // Pipelined request available — loop immediately.
+        }
+    }
+
     // -------------------------------------------------------------------------
     // dispatchPoolCqe — legacy (non-batch) dispatch.
     // Only called when batch_port_id == 0 (before ZigIo_SetBatchPort fires).
@@ -620,6 +734,55 @@ pub const EventLoop = struct {
                 }
                 _ = engine.Dart_PostInteger(ctx.port_id, if (close) -1 else 0);
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
+            },
+            .loop => {
+                // Legacy path: synchronous keep-alive loop until connection closes.
+                const sd = &ctx.data.loop;
+                if (cqe.res <= 0) {
+                    _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+                sd.recv_len += @intCast(cqe.res);
+                // Pipeline: serve all complete requests in recv_buf.
+                while (true) {
+                    const rr = http_parser.routeRequestFull(sd.recv_buf[0..sd.recv_len]);
+                    if (rr.route == http_parser.RouteId.incomplete) {
+                        // Need more data — resubmit recv.
+                        const space = sd.recv_buf[sd.recv_len..];
+                        if (space.len > 0) {
+                            _ = self.ring.read(state.kPoolBase + @as(u64, idx), ctx.fd, .{ .buffer = space }, 0) catch {};
+                        } else {
+                            _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                            state.freeSlot(self.pool, &self.slot_alloc, idx);
+                        }
+                        return;
+                    }
+                    const close = http_responses.shouldClose(rr.route);
+                    if (http_responses.forRoute(rr.route)) |resp| {
+                        var written: usize = 0;
+                        while (written < resp.len) {
+                            const n = posix.write(ctx.fd, resp[written..]) catch break;
+                            if (n == 0) break;
+                            written += n;
+                        }
+                    }
+                    if (close) {
+                        _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                        state.freeSlot(self.pool, &self.slot_alloc, idx);
+                        return;
+                    }
+                    const remaining = sd.recv_len - rr.consumed;
+                    if (remaining > 0) {
+                        std.mem.copyForwards(u8, sd.recv_buf[0..remaining], sd.recv_buf[rr.consumed..sd.recv_len]);
+                    }
+                    sd.recv_len = remaining;
+                    if (remaining == 0) {
+                        // Buffer empty — resubmit recv for next request.
+                        _ = self.ring.read(state.kPoolBase + @as(u64, idx), ctx.fd, .{ .buffer = sd.recv_buf[0..] }, 0) catch {};
+                        return;
+                    }
+                }
             },
             .send => {
                 _ = engine.Dart_PostInteger(ctx.port_id, cqe.res);
@@ -711,6 +874,7 @@ const uring_ops = state.LoopOps{
     .submit_recv = submitRecv,
     .submit_recv_route = submitRecvRoute,
     .submit_serve = submitServe,
+    .submit_loop = submitLoop,
     .submit_send = submitSend,
 };
 
@@ -744,6 +908,17 @@ fn submitServe(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
     const ctx = &self.pool[slot_idx];
     const user_data: u64 = state.kPoolBase + @as(u64, slot_idx);
     _ = self.ring.read(user_data, fd, .{ .buffer = ctx.data.serve.recv_buf[0..] }, 0) catch {
+        self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
+        state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
+    };
+}
+
+/// Arm a recv SQE for a loop slot. Completion handler handles entire keep-alive connection.
+fn submitLoop(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
+    const self: *EventLoop = @ptrCast(@alignCast(loop));
+    const ctx = &self.pool[slot_idx];
+    const user_data: u64 = state.kPoolBase + @as(u64, slot_idx);
+    _ = self.ring.read(user_data, fd, .{ .buffer = ctx.data.loop.recv_buf[0..] }, 0) catch {
         self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     };

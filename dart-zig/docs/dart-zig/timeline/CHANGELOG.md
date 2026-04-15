@@ -2,6 +2,53 @@
 
 ---
 
+## PERF-6 — Keep-alive loop native: zero Dart interactions per request (2026-04-15)
+
+**What changed:**
+- New `Op.loop` in `state.zig` — reuses `ServeData` struct (adds `pending_consumed: usize` field)
+- New `submit_loop` vtable entry in `LoopOps`
+- `kqueue.zig`: `processLoopPipeline()` helper + `.loop` in `collectPoolEvent` + `.loop` in `dispatchPoolEvent` + `submitLoop()`
+- `io_uring.zig`: `processLoopPipeline()` helper + `.loop` in `collectPoolCqe` + `.loop` in `dispatchPoolCqe` + `submitLoop()`
+- `tcp.zig`: `ZigIo_TcpLoopToken(connFd, token)` native — allocates slot, sets `op=.loop`, submits
+- `native_table.zig`: registered `ZigIo_TcpLoopToken` argc=2
+- `zig_io.dart`: `_zigIoTcpLoopToken` extern + `zigIoTcpLoopFuture(connFd)` function
+- `http_server.dart`: `_handleConn` reduced to `await zigIoTcpLoopFuture(connFd); zigIoClose(connFd);`
+
+**Key design — pipelining inner loop:**
+After writing the response, if `recv_buf` still contains bytes (pipelined request from the same `recv`), call `routeRequestFull()` again immediately without re-arming the socket. This eliminates the kevent/CQE roundtrip for pipelined requests — pure CPU processing only.
+
+```
+recv → routeRequestFull() → posix.write() → memmove → routeRequestFull() → ... → re-arm recv
+```
+
+**Dart hot-path changes:**
+- Before: accept → `while { await zigIoTcpServeFuture() }` = 1 await/request
+- After:  accept → `await zigIoTcpLoopFuture()` = 1 await/connection = **0 await/request**
+
+**Results (macOS ARM64, kqueue, JIT/AOT, `wrk -t4 -c128 -d10s`):**
+
+| Phase | JIT req/s | AOT req/s | vs PERF-4 |
+|-------|----------:|----------:|----------:|
+| PERF-4 (serve op, 1 await/req) | ~178k | ~178k | baseline |
+| **PERF-6 (loop op, 0 await/req)** | **~243k** | **~275k** | **+37% JIT / +54% AOT** |
+
+**Results (Linux VPS, 6-core, io_uring, ReleaseFast, taskset CPU-pinned, `bench_vps.sh`):**
+
+| Config | PERF-4 | PERF-6 (no fix) | PERF-6 + safepoint fix |
+|--------|-------:|----------------:|-----------------------:|
+| JIT 1w | 95k | 67k (-30%) | **~102k (+7%)** |
+| JIT 3w | 206k | 201k | ~200k |
+| JIT 6w | 192k | 210k | ~210k |
+| AOT 1w | 97k | 97k | 97k |
+| AOT 3w | 238k | 211k | ~204k |
+| AOT 6w | 187k | 207k | ~206k |
+
+**JIT safepoint fix (`jit_idle_iters`, threshold=128):** Without regular `DartEngine_HandleMessage` calls (Dart is only woken on connection close), JIT background compiler threads on a single-core-pinned process starve. Confirmed by `ps -L` showing a DartWorker thread competing with the event loop. Fix: every 128 event-loop iterations where pool I/O fired but no Dart batch was posted, call `DartEngine_AcquireIsolate/ReleaseIsolate` — creates a safepoint without running Dart code or GC. This recovers JIT 1w from 67k → ~102k (beats PERF-4 baseline).
+
+**Key insight:** Eliminating the HashMap lookup + Completer.complete() overhead per request unlocks significant gains, especially for AOT where Dart execution is cheaper (TFA tree-shaking reduces dispatch overhead). JIT still benefits because the event loop no longer needs to context-switch into Dart between requests.
+
+---
+
 ## PERF-5 — Correctness: partial read accumulation + pool exhaustion 503 (2026-04-15)
 
 **Problems fixed:**

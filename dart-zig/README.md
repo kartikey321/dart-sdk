@@ -9,22 +9,23 @@ layers between the Dart VM and the kernel.
 
 ## Status
 
-PERF-4 — Fused serve op (read+route+write in Zig, one await per request, zero Dart heap allocation).
+PERF-6 — Keep-alive loop native (entire connection lifecycle in Zig, zero Dart interactions per request).
 
-**macOS ARM64 single-worker (kqueue, JIT, `wrk -t4 -c128 -d8s`):**
+**macOS ARM64 single-worker (kqueue, `wrk -t4 -c128 -d10s`):**
 ```
-PERF-4 (serve op):  ~178k req/s   (1 await/request, 0 heap allocs)
-Phase 14 baseline:  ~159k req/s   (3 awaits/request, batch dispatcher)
+PERF-6 (loop op):   ~243k req/s JIT  /  ~275k req/s AOT  (0 await/request, 0 heap allocs)
+PERF-4 (serve op):  ~178k req/s      (1 await/request, 0 heap allocs)
+Phase 14 baseline:  ~159k req/s      (3 awaits/request, batch dispatcher)
 ```
 
 **Linux VPS 6-core (io_uring, ReleaseFast, taskset CPU-pinned, `bench_vps.sh`):**
 ```
-               JIT       AOT     vs Phase-14 JIT
-1 worker:     95k       97k          2.5×
-3 workers:   206k      238k          1.6×
-6 workers:   192k      187k     (client/server compete for cores 3-5)
+               JIT       AOT     vs PERF-4 JIT
+1 worker:    ~102k      97k          +7%
+3 workers:   ~200k     ~204k         ~flat
+6 workers:   ~210k     ~207k         +9%
 ```
-> AOT ≈ JIT at 1 worker: Dart execution is no longer the bottleneck after fused serve op.
+> JIT 1w beats PERF-4 (95k) after JIT safepoint fix (`jit_idle_iters` threshold=128 in io_uring.zig).
 
 ---
 
@@ -285,14 +286,15 @@ dart-zig/
 
 ### macOS ARM64, kqueue, `wrk -t4 -c128`
 
-| Phase  | What                          | req/sec (single worker) |
-|--------|-------------------------------|------------------------:|
-| 11     | AOT baseline (echo)           | 291k avg                |
-| 13     | HTTP/1.1 server               | 133–147k                |
-| 14     | Batch dispatcher              | ~159k                   |
-| PERF-2 | ZigHttp_RouteRequest          | ~163k _(est.)_          |
-| PERF-3 | recv_route op                 | ~170k _(est.)_          |
-| **PERF-4** | **Fused serve op**        | **~178k**               |
+| Phase  | What                          | req/sec JIT | req/sec AOT |
+|--------|-------------------------------|------------:|------------:|
+| 11     | AOT baseline (echo)           | —           | 291k avg    |
+| 13     | HTTP/1.1 server               | 133–147k    | —           |
+| 14     | Batch dispatcher              | ~159k       | —           |
+| PERF-2 | ZigHttp_RouteRequest          | ~163k       | —           |
+| PERF-3 | recv_route op                 | ~170k       | —           |
+| PERF-4 | Fused serve op (1 await/req)  | ~178k       | ~178k       |
+| **PERF-6** | **Loop native (0 await/req)** | **~243k** | **~275k** |
 
 ### Linux VPS, 6-core, io_uring, taskset CPU-pinned, ReleaseFast
 

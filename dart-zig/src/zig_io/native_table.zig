@@ -33,6 +33,7 @@ pub const table: []const NativeEntry = &.{
     .{ .name = "ZigIo_TcpReadToken", .argc = 3, .func = natives.tcp.ZigIo_TcpReadToken, .auto_scope = true },
     .{ .name = "ZigIo_TcpReadRouteToken", .argc = 2, .func = natives.tcp.ZigIo_TcpReadRouteToken, .auto_scope = true },
     .{ .name = "ZigIo_TcpServeToken", .argc = 2, .func = natives.tcp.ZigIo_TcpServeToken, .auto_scope = true },
+    .{ .name = "ZigIo_TcpLoopToken", .argc = 2, .func = natives.tcp.ZigIo_TcpLoopToken, .auto_scope = true },
     .{ .name = "ZigIo_TcpWriteBytesToken", .argc = 3, .func = natives.tcp.ZigIo_TcpWriteBytesToken, .auto_scope = true },
     // tls.zig — token-based TLS API
     .{ .name = "ZigTls_Configure", .argc = 2, .func = natives.tls.ZigTls_Configure, .auto_scope = true },

@@ -79,6 +79,9 @@ external void _zigIoTcpReadRouteToken(int connFd, int token);
 @pragma('vm:external-name', 'ZigIo_TcpWriteBytesToken')
 external void _zigIoTcpWriteBytesToken(int connFd, Uint8List bytes, int token);
 
+@pragma('vm:external-name', 'ZigIo_TcpLoopToken')
+external void _zigIoTcpLoopToken(int connFd, int token);
+
 /// Per-isolate batch dispatcher. Initialised lazily on first token I/O call.
 /// All completions from one kevent() batch arrive in one List message,
 /// reducing DartEngine_HandleMessage call count from N to 1.
@@ -131,6 +134,14 @@ Future<Uint8List?> zigIoTcpReadFuture(int connFd, int maxBytes) =>
 Future<int> zigIoTcpServeFuture(int connFd) =>
     _dispatcher
         .submit<int>((t) => _zigIoTcpServeToken(connFd, t))
+        .then((v) => (v as int?) ?? -1);
+
+/// Keep-alive connection loop: entire connection lifecycle handled in Zig.
+/// One await per connection (not per request). Returns -1 when the connection closes.
+/// Handles HTTP pipelining automatically — no Dart involvement per request.
+Future<int> zigIoTcpLoopFuture(int connFd) =>
+    _dispatcher
+        .submit<int>((t) => _zigIoTcpLoopToken(connFd, t))
         .then((v) => (v as int?) ?? -1);
 
 /// Read from [connFd], parse+route in Zig. Returns a [RouteId] int.

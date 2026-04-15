@@ -17,26 +17,22 @@
 import 'zig_io.dart';
 
 // ---------------------------------------------------------------------------
-// Connection handler — one await per request.
+// Connection handler — one await per connection (PERF-6 loop op).
 //
-// zigIoTcpServeFuture() is a fused Zig op that:
-//   1. Reads bytes from the fd into a pool slot buffer
-//   2. Calls routeRequest() in the completion handler
-//   3. Looks up the comptime-constant response slice (responses.zig)
-//   4. Writes the response inline via posix.write() fast-path
-//   5. Posts 0 (keep-alive) or -1 (close) to Dart
+// zigIoTcpLoopFuture() is a fused Zig op that handles the entire keep-alive
+// connection lifecycle without returning to Dart between requests:
+//   recv → routeRequestFull() → inline posix.write() → memmove → repeat
 //
-// Zero Dart heap allocation per request — no Uint8List, no GC, no memcpy.
+// HTTP pipelining: if multiple requests arrived in one recv, they are all
+// served immediately without re-arming the socket.
+//
+// Posts only when the connection closes (returns -1).
+// Zero Dart heap allocation per request or per connection.
 // ---------------------------------------------------------------------------
 
 Future<void> _handleConn(int connFd) async {
-  while (true) {
-    final result = await zigIoTcpServeFuture(connFd);
-    if (result != 0) {
-      zigIoClose(connFd);
-      return;
-    }
-  }
+  await zigIoTcpLoopFuture(connFd);
+  zigIoClose(connFd);
 }
 
 // ---------------------------------------------------------------------------

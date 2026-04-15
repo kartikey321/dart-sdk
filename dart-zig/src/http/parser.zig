@@ -131,22 +131,37 @@ pub const RouteId = struct {
     pub const incomplete:  i64 = -4; // need more data (serve op re-arms recv)
 };
 
+/// Result of routeRequestFull — route id + bytes consumed from the buffer.
+/// consumed is body_offset for a complete request (all headers + blank line).
+/// Used by the loop op to detect and process pipelined requests from leftover buffer bytes.
+pub const RouteResult = struct {
+    route: i64,
+    consumed: usize,
+};
+
+/// Like routeRequest() but also returns how many bytes were consumed.
+/// After writing the response, shift recv_buf[consumed..] to front and try routing again
+/// to handle pipelined requests without re-arming recv.
+pub fn routeRequestFull(buf: []const u8) RouteResult {
+    const r = parse(buf);
+    if (r.status == .incomplete) return .{ .route = RouteId.incomplete, .consumed = 0 };
+    if (r.status != .complete) return .{ .route = RouteId.bad_request, .consumed = 0 };
+    const path = r.path;
+    const route: i64 = if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html"))
+        RouteId.hello
+    else if (std.mem.eql(u8, path, "/ping"))
+        RouteId.ping
+    else
+        RouteId.not_found;
+    return .{ .route = route, .consumed = r.body_offset };
+}
+
 /// Parse the request in `buf` and return a RouteId integer.
 /// Returns incomplete (-4) when more data is needed — callers should buffer and retry.
 /// Returns bad_request (-2) only for definitively malformed requests.
 /// Zero allocations — only stack memory used.
 pub fn routeRequest(buf: []const u8) i64 {
-    const r = parse(buf);
-    if (r.status == .incomplete) return RouteId.incomplete;
-    if (r.status != .complete) return RouteId.bad_request;
-    const path = r.path;
-    if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
-        return RouteId.hello;
-    }
-    if (std.mem.eql(u8, path, "/ping")) {
-        return RouteId.ping;
-    }
-    return RouteId.not_found;
+    return routeRequestFull(buf).route;
 }
 
 // ---------------------------------------------------------------------------

@@ -198,6 +198,35 @@ pub fn ZigIo_TcpServeToken(args: engine.Dart_NativeArguments) callconv(.c) void 
     loop.ops.submit_serve(loop.ptr, idx, @intCast(fd_val));
 }
 
+/// ZigIo_TcpLoopToken(connFd: int, token: int) → void
+/// Keep-alive connection loop: entire connection lifecycle handled in Zig.
+/// Only posts to Dart on close/error — one await per connection, zero per request.
+/// Handles HTTP pipelining: multiple requests buffered in one recv are all served
+/// without re-arming recv, via memmove + immediate re-routing.
+pub fn ZigIo_TcpLoopToken(args: engine.Dart_NativeArguments) callconv(.c) void {
+    if (profiler.enabled) profiler.p.onNativeEntry(.read);
+    var fd_val: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 0, &fd_val);
+    var token: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 1, &token);
+
+    const loop = state.current_loop orelse return;
+    const idx = state.allocSlot(loop.pool, loop.slot_alloc) orelse {
+        // Pool exhausted — send 503 synchronously, post close.
+        _ = posix.write(@intCast(fd_val), http_responses.service_unavailable) catch {};
+        postTokenInt(loop, token, -1);
+        return;
+    };
+    const ctx = &loop.pool[idx];
+    ctx.op = .loop;
+    ctx.port_id = token;
+    ctx.fd = @intCast(fd_val);
+    ctx.tls_id = 0;
+    ctx.data = .{ .loop = .{} };
+    if (profiler.enabled) profiler.p.onNativePost();
+    loop.ops.submit_loop(loop.ptr, idx, @intCast(fd_val));
+}
+
 /// ZigIo_TcpReadRouteToken(connFd: int, token: int) → void
 /// Read bytes from connFd, parse+route in Zig, post a RouteId int to Dart.
 /// Zero Uint8List allocation — eliminates ApiMessageSerializer, memcpy, GC pressure.
