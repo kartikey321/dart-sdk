@@ -91,10 +91,12 @@ run_bench() {
     local bin="$3"
     local snap="$4"
 
-    # Pin server to cores 0..(workers-1)
+    # Pin server to cores 0..(min(workers,3)-1) to avoid competing with wrk on 3-5.
+    # On a 6-core VPS: server gets cores 0-2 max; wrk gets 3-5.
+    local pinned_workers=$(( workers < 3 ? workers : 3 ))
     local server_cores="0"
-    if [[ $workers -gt 1 ]]; then
-        server_cores="0-$((workers - 1))"
+    if [[ $pinned_workers -gt 1 ]]; then
+        server_cores="0-$((pinned_workers - 1))"
     fi
 
     # Kill any leftover server

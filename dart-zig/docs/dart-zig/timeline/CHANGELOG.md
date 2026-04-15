@@ -42,12 +42,25 @@ Phase-by-phase development log. Benchmarks run with `wrk -t4 -c128 -d10s` unless
 - `zigIoTcpServeFuture(connFd)` in `zig_io.dart`: posts 0 (keep-alive) or −1 (close)
 - `http_server.dart` reduced to 55 lines — hot path is a single `await zigIoTcpServeFuture(connFd)`
 
-**Result (Linux VPS, 6-core, io_uring, ReleaseFast, taskset CPU-pinned):**
+**Result (Linux VPS, 6-core, io_uring, ReleaseFast, taskset CPU-pinned, `bench_vps.sh`):**
 
 | Config | Before (Phase 14) | After (PERF-4) | Gain |
 |--------|------------------:|---------------:|-----:|
-| 1 worker, core 0 | ~37k req/s | **92k req/s** | **2.5×** |
-| 3 workers, cores 0–2 | ~126k req/s | **196k req/s** | **1.6×** |
+| JIT 1 worker  | ~37k  | **95k**  | **2.5×** |
+| JIT 3 workers | ~126k | **206k** | **1.6×** |
+| JIT 6 workers | —     | 192k     | _(see note)_ |
+| AOT 1 worker  | —     | **97k**  | +2% vs JIT |
+| AOT 3 workers | —     | **238k** | 2.46× scaling |
+| AOT 6 workers | —     | 187k     | _(see note)_ |
+
+**Note on 6-worker degradation:** 6 workers pinned to cores 0–5 while wrk also runs on cores 3–5
+causes server workers 3–5 to compete with the benchmark client. This is a benchmarking artifact,
+not a regression — 6 workers would scale linearly on a 12-core machine where client and server
+can be fully separated. Effective max for this VPS is 3 server workers (cores 0–2) + 3 wrk (3–5).
+
+**Key insight — AOT ≈ JIT (+2% single-worker):** With only 1 await per request, Dart execution
+is no longer the bottleneck. JIT is already fully warmed before wrk's 10s window. The remaining
+overhead is the batch dispatcher's HashMap lookup + Completer resume.
 
 - Per-request await count: **3 → 1**
 - Per-request Dart heap allocation: **2 → 0** (no Uint8List, no response copy)

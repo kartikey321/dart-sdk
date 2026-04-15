@@ -17,12 +17,14 @@ PERF-4 (serve op):  ~178k req/s   (1 await/request, 0 heap allocs)
 Phase 14 baseline:  ~159k req/s   (3 awaits/request, batch dispatcher)
 ```
 
-**Linux VPS 6-core (io_uring, ReleaseFast, taskset CPU-pinned):**
+**Linux VPS 6-core (io_uring, ReleaseFast, taskset CPU-pinned, `bench_vps.sh`):**
 ```
-              Before (Phase 14)   After (PERF-4)   Gain
-1 worker:          ~37k req/s       ~92k req/s      2.5×
-3 workers:        ~126k req/s      ~196k req/s      1.6×
+               JIT       AOT     vs Phase-14 JIT
+1 worker:     95k       97k          2.5×
+3 workers:   206k      238k          1.6×
+6 workers:   192k      187k     (client/server compete for cores 3-5)
 ```
+> AOT ≈ JIT at 1 worker: Dart execution is no longer the bottleneck after fused serve op.
 
 ---
 
@@ -294,10 +296,12 @@ dart-zig/
 
 ### Linux VPS, 6-core, io_uring, taskset CPU-pinned, ReleaseFast
 
-| Phase  | 1 worker | 3 workers | Notes |
-|--------|----------:|----------:|-------|
-| 14     | ~37k     | ~126k     | 3.4× scaling |
-| **PERF-4** | **~92k** | **~196k** | **2.5× single-worker gain** |
+| Phase  | 1w JIT | 3w JIT | 6w JIT | 1w AOT | 3w AOT | Notes |
+|--------|-------:|-------:|-------:|-------:|-------:|-------|
+| 14     | ~37k  | ~126k  | —     | —     | —     | 3 awaits/req |
+| **PERF-4/5** | **95k** | **206k** | 192k¹ | **97k** | **238k** | **1 await/req** |
+
+> ¹ 6-worker number limited by core contention on a 6-core VPS — wrk and server share cores 3–5.
 
 ### Linux VPS, 6-core, io_uring, taskset CPU-pinned
 
