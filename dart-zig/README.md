@@ -9,12 +9,19 @@ layers between the Dart VM and the kernel.
 
 ## Status
 
-Phase 11 — AOT compilation supported. Benchmarked on macOS (kqueue) and Linux (io_uring via Docker).
+PERF-4 — Fused serve op (read+route+write in Zig, one await per request, zero Dart heap allocation).
 
-**macOS ARM64 steady-state (kqueue, AOT):**
+**macOS ARM64 single-worker (kqueue, JIT, `wrk -t4 -c128 -d8s`):**
 ```
-dart-zig AOT:  294k → 294k → 286k req/s   (~291k avg)
-dart:io  AOT:  290k → 286k → 282k req/s   (~283k avg)
+PERF-4 (serve op):  ~178k req/s   (1 await/request, 0 heap allocs)
+Phase 14 baseline:  ~159k req/s   (3 awaits/request, batch dispatcher)
+```
+
+**Linux VPS 6-core (io_uring, multi-worker, taskset CPU-pinned) — pre-PERF-4:**
+```
+1 worker  (core 0):      ~37k req/s
+3 workers (cores 0–2):  ~126k req/s   (3.4× — near-linear)
+6 workers:               TBD post PERF-4
 ```
 
 ---
@@ -248,8 +255,9 @@ dart-zig/
 │   │       ├── write.zig        # ZigIo_StdoutWrite
 │   │       └── version.zig      # ZigIo_Version
 │   └── http/
-│       ├── parser.zig           # Zero-allocation HTTP/1.1 state machine (with tests)
-│       ├── natives.zig          # ZigHttp_Parse synchronous native
+│       ├── parser.zig           # Zero-allocation HTTP/1.1 state machine + routeRequest()
+│       ├── responses.zig        # Comptime-constant response byte slices (serve op)
+│       ├── natives.zig          # ZigHttp_Parse / ZigHttp_RouteRequest natives
 │       ├── native_table.zig     # ZigHttp native lookup table
 │       └── resolver.zig         # ZigHttp native function resolver
 ├── lib/
@@ -271,23 +279,30 @@ dart-zig/
 
 ---
 
-## Benchmark History (macOS ARM64, kqueue)
+## Benchmark History
 
-| Phase | dart-zig JIT warm | dart:io JIT warm | dart-zig AOT | dart:io AOT |
-|-------|------------------:|-----------------:|-------------:|------------:|
-| 8     | ~120k             | ~120k            | —            | —           |
-| 9     | ~170k             | ~150k            | —            | —           |
-| 10a   | ~200k             | ~180k            | —            | —           |
-| 10c   | ~270k             | ~240k            | —            | —           |
-| **11**| **274k**          | **253k**         | **291k avg** | **283k avg**|
-| 12    | _(client-limited)_| —                | ~350k        | —           |
-| 13    | —                 | —                | 133–147k HTTP| —           |
-| 14    | —                 | —                | 159k HTTP    | —           |
+### macOS ARM64, kqueue, `wrk -t4 -c128`
 
-> **Notes:**
-> - Phase 12+ numbers use `kPoolSize=4096` (32 MB pool).
-> - Phase 12 echo numbers plateau at ~350k because the benchmark client (single Dart event loop) saturates first. A multi-threaded client (wrk, bombardier) is needed to show N× scaling.
-> - Phase 13–14 HTTP numbers from `wrk -t4 -c128 -d10s` on the same machine as the server; client/server compete for cores.
+| Phase  | What                          | req/sec (single worker) |
+|--------|-------------------------------|------------------------:|
+| 11     | AOT baseline (echo)           | 291k avg                |
+| 13     | HTTP/1.1 server               | 133–147k                |
+| 14     | Batch dispatcher              | ~159k                   |
+| PERF-2 | ZigHttp_RouteRequest          | ~163k _(est.)_          |
+| PERF-3 | recv_route op                 | ~170k _(est.)_          |
+| **PERF-4** | **Fused serve op**        | **~178k**               |
+
+### Linux VPS, 6-core, io_uring, taskset CPU-pinned
+
+| Workers | Server cores | req/sec (pre-PERF-4) |
+|---------|-------------|---------------------:|
+| 1       | 0           | ~37k                 |
+| 3       | 0–2         | ~126k (3.4×)         |
+| 6       | 0–2         | TBD                  |
+
+> - Phase 13–14 HTTP measured with wrk on same machine; client/server compete for cores.
+> - Linux multi-worker uses `taskset -c` to pin server + client to separate core ranges.
+> - PERF-3/4 estimates based on macOS; VPS numbers pending next benchmark run.
 
 ---
 

@@ -10,6 +10,8 @@ const engine = @import("../engine.zig");
 const state = @import("../zig_io/state.zig");
 const tls_module = @import("../zig_io/tls.zig");
 const profiler = @import("../profiler.zig");
+const http_parser = @import("../http/parser.zig");
+const http_responses = @import("../http/responses.zig");
 
 // kqueue filter constants not exposed in std.c on all Zig versions
 const EVFILT_SIGNAL: i16 = -6;
@@ -227,6 +229,18 @@ pub const EventLoop = struct {
         bytes_len: usize = 0,
     };
 
+    /// Re-arm a serve slot for EVFILT_WRITE (partial write remainder path).
+    fn armServeWrite(self: *EventLoop, idx: usize, fd: posix.fd_t) bool {
+        const udata = @as(usize, state.kPoolBase) + idx;
+        return addKevent(
+            self.kq,
+            @intCast(fd),
+            EVFILT_WRITE,
+            @as(u16, c.EV.ADD | c.EV.ENABLE | c.EV.ONESHOT),
+            udata,
+        );
+    }
+
     fn armTlsHandshake(self: *EventLoop, idx: usize, fd: posix.fd_t, wait_write: bool) bool {
         const filter: i16 = if (wait_write) EVFILT_WRITE else @as(i16, c.EVFILT.READ);
         const udata = @as(usize, state.kPoolBase) + idx;
@@ -298,6 +312,90 @@ pub const EventLoop = struct {
                     out.bytes_len = bytes_read;
                 }
                 return true;
+            },
+            .recv_route => {
+                // Read bytes then parse+route in Zig — posts a route int, not a Uint8List.
+                // Eliminates Dart Uint8List allocation, ApiMessageSerializer, memcpy, and GC pressure.
+                const bytes_read = posix.read(ctx.fd, ctx.data.recv_route.buf[0..]) catch {
+                    out.kind = .int_val;
+                    out.int_val = http_parser.RouteId.eof;
+                    return true;
+                };
+                if (bytes_read == 0) {
+                    out.kind = .int_val;
+                    out.int_val = http_parser.RouteId.eof;
+                } else {
+                    out.kind = .int_val;
+                    out.int_val = http_parser.routeRequest(ctx.data.recv_route.buf[0..bytes_read]);
+                }
+                return true;
+            },
+            .serve => {
+                const sd = &ctx.data.serve;
+                if (!sd.write_phase) {
+                    // Phase 1: recv fired — read, route, write inline.
+                    const bytes_read = posix.read(ctx.fd, sd.recv_buf[0..]) catch {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    };
+                    if (bytes_read == 0) {
+                        out.kind = .int_val;
+                        out.int_val = -1; // EOF
+                        return true;
+                    }
+                    const route = http_parser.routeRequest(sd.recv_buf[0..bytes_read]);
+                    sd.should_close = http_responses.shouldClose(route);
+                    const resp = http_responses.forRoute(route) orelse {
+                        // eof or unknown — close without sending
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    };
+                    // Inline write — almost always completes fully for <200B responses.
+                    const n = posix.write(ctx.fd, resp) catch {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    };
+                    if (n >= resp.len) {
+                        // Full write done — complete the serve op.
+                        out.kind = .int_val;
+                        out.int_val = if (sd.should_close) -1 else 0;
+                        return true;
+                    }
+                    // Partial write (rare on loopback) — arm EVFILT_WRITE for remainder.
+                    sd.write_ptr = resp.ptr + n;
+                    sd.write_len = resp.len - n;
+                    sd.write_phase = true;
+                    if (!self.armServeWrite(idx, ctx.fd)) {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    }
+                    return false; // don't complete yet
+                } else {
+                    // Phase 2: EVFILT_WRITE fired — write the remainder.
+                    const n = posix.write(ctx.fd, sd.write_ptr[0..sd.write_len]) catch {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    };
+                    if (n >= sd.write_len) {
+                        out.kind = .int_val;
+                        out.int_val = if (sd.should_close) -1 else 0;
+                        return true;
+                    }
+                    // Still partial — update and re-arm.
+                    sd.write_ptr += n;
+                    sd.write_len -= n;
+                    if (!self.armServeWrite(idx, ctx.fd)) {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    }
+                    return false;
+                }
             },
             .send => {
                 const bytes_written = posix.write(ctx.fd, ctx.data.send.buf[0..ctx.data.send.len]) catch {
@@ -477,6 +575,46 @@ pub const EventLoop = struct {
                 state.postRecvResult(ctx.port_id, @intCast(bytes_read), ctx.data.recv.buf[0..]);
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
             },
+            .recv_route => {
+                // Legacy (pre-batch) path: read + route in Zig, post int directly.
+                const bytes_read = posix.read(ctx.fd, ctx.data.recv_route.buf[0..]) catch {
+                    _ = engine.Dart_PostInteger(ctx.port_id, http_parser.RouteId.eof);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                };
+                const route: i64 = if (bytes_read == 0)
+                    http_parser.RouteId.eof
+                else
+                    http_parser.routeRequest(ctx.data.recv_route.buf[0..bytes_read]);
+                _ = engine.Dart_PostInteger(ctx.port_id, route);
+                state.freeSlot(self.pool, &self.slot_alloc, idx);
+            },
+            .serve => {
+                // Legacy path: full synchronous serve — read, route, write.
+                const sd = &ctx.data.serve;
+                const bytes_read = posix.read(ctx.fd, sd.recv_buf[0..]) catch {
+                    _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                };
+                if (bytes_read == 0) {
+                    _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+                const route = http_parser.routeRequest(sd.recv_buf[0..bytes_read]);
+                const close = http_responses.shouldClose(route);
+                if (http_responses.forRoute(route)) |resp| {
+                    var written: usize = 0;
+                    while (written < resp.len) {
+                        const n = posix.write(ctx.fd, resp[written..]) catch break;
+                        if (n == 0) break;
+                        written += n;
+                    }
+                }
+                _ = engine.Dart_PostInteger(ctx.port_id, if (close) -1 else 0);
+                state.freeSlot(self.pool, &self.slot_alloc, idx);
+            },
             .send => {
                 const bytes_written = posix.write(ctx.fd, ctx.data.send.buf[0..ctx.data.send.len]) catch {
                     _ = engine.Dart_PostInteger(ctx.port_id, -1);
@@ -638,6 +776,8 @@ pub const EventLoop = struct {
 const kqueue_ops = state.LoopOps{
     .submit_accept = submitAccept,
     .submit_recv = submitRecv,
+    .submit_recv_route = submitRecv, // same kevent registration; op field distinguishes dispatch
+    .submit_serve = submitServe,
     .submit_send = submitSend,
 };
 
@@ -683,6 +823,23 @@ fn submitRecv(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
     )) {
         const ctx = &self.pool[slot_idx];
         self.postSingleCompletion(ctx.port_id, slot_idx, .null_val, 0, 0);
+        state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
+    }
+}
+
+/// Arm EVFILT_READ for a serve slot — completion handler does read+route+write.
+fn submitServe(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
+    const self: *EventLoop = @ptrCast(@alignCast(loop));
+    const udata = @as(usize, state.kPoolBase) + slot_idx;
+    if (!addKevent(
+        self.kq,
+        @intCast(fd),
+        @as(i16, c.EVFILT.READ),
+        @as(u16, c.EV.ADD | c.EV.ENABLE | c.EV.ONESHOT),
+        udata,
+    )) {
+        const ctx = &self.pool[slot_idx];
+        self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     }
 }

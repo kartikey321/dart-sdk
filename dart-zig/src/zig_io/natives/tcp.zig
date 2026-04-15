@@ -3,6 +3,7 @@ const posix = std.posix;
 const engine = @import("../../engine.zig");
 const state = @import("../state.zig");
 const profiler = @import("../../profiler.zig");
+const http_parser = @import("../../http/parser.zig");
 
 /// ZigIo_TcpBind(host: String, port: int, backlog: int) → int (fd or -errno)
 /// Synchronous: creates, binds, and listens a TCP socket. Returns fd on success.
@@ -166,6 +167,56 @@ pub fn ZigIo_TcpReadToken(args: engine.Dart_NativeArguments) callconv(.c) void {
     ctx.data = .{ .recv = .{} };
     if (profiler.enabled) profiler.p.onNativePost();
     loop.ops.submit_recv(loop.ptr, idx, @intCast(fd_val));
+}
+
+/// ZigIo_TcpServeToken(connFd: int, token: int) → void
+/// Fused read+route+write in one async op. Posts 0 (keep-alive) or -1 (close) to Dart.
+/// One await per request instead of two — eliminates one Dart isolate crossing + Completer resume.
+pub fn ZigIo_TcpServeToken(args: engine.Dart_NativeArguments) callconv(.c) void {
+    if (profiler.enabled) profiler.p.onNativeEntry(.read);
+    var fd_val: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 0, &fd_val);
+    var token: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 1, &token);
+
+    const loop = state.current_loop orelse return;
+    const idx = state.allocSlot(loop.pool, loop.slot_alloc) orelse {
+        postTokenInt(loop, token, -1);
+        return;
+    };
+    const ctx = &loop.pool[idx];
+    ctx.op = .serve;
+    ctx.port_id = token;
+    ctx.fd = @intCast(fd_val);
+    ctx.tls_id = 0;
+    ctx.data = .{ .serve = .{} };
+    if (profiler.enabled) profiler.p.onNativePost();
+    loop.ops.submit_serve(loop.ptr, idx, @intCast(fd_val));
+}
+
+/// ZigIo_TcpReadRouteToken(connFd: int, token: int) → void
+/// Read bytes from connFd, parse+route in Zig, post a RouteId int to Dart.
+/// Zero Uint8List allocation — eliminates ApiMessageSerializer, memcpy, GC pressure.
+pub fn ZigIo_TcpReadRouteToken(args: engine.Dart_NativeArguments) callconv(.c) void {
+    if (profiler.enabled) profiler.p.onNativeEntry(.read);
+    var fd_val: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 0, &fd_val);
+    var token: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 1, &token);
+
+    const loop = state.current_loop orelse return;
+    const idx = state.allocSlot(loop.pool, loop.slot_alloc) orelse {
+        postTokenInt(loop, token, http_parser.RouteId.eof);
+        return;
+    };
+    const ctx = &loop.pool[idx];
+    ctx.op = .recv_route;
+    ctx.port_id = token;
+    ctx.fd = @intCast(fd_val);
+    ctx.tls_id = 0;
+    ctx.data = .{ .recv_route = .{} };
+    if (profiler.enabled) profiler.p.onNativePost();
+    loop.ops.submit_recv_route(loop.ptr, idx, @intCast(fd_val));
 }
 
 /// ZigIo_TcpWriteBytesToken(connFd: int, bytes: Uint8List, token: int) → void

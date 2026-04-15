@@ -127,6 +127,7 @@ pub const RouteId = struct {
     pub const ping:        i64 = 1;  // GET /ping
     pub const not_found:   i64 = -1; // valid request, unknown path
     pub const bad_request: i64 = -2; // malformed or incomplete
+    pub const eof:         i64 = -3; // connection closed or read error (recv_route only)
 };
 
 /// Parse the request in `buf` and return a RouteId integer.

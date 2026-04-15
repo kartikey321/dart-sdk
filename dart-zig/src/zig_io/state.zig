@@ -14,7 +14,7 @@ pub const kPoolBase: u64 = 16;
 /// 4096 slots × 8 KB = 32 MB total — stays resident in L3 cache.
 pub const kBufSize: usize = 8192;
 
-pub const Op = enum(u8) { accept, recv, send, tls_handshake };
+pub const Op = enum(u8) { accept, recv, recv_route, serve, send, tls_handshake };
 
 pub const CompletionCtx = struct {
     in_use: bool = false,
@@ -31,6 +31,14 @@ pub const CompletionCtx = struct {
         /// Filled by the kernel (io_uring) or posix.read (kqueue).
         /// Immediately reusable after postRecvResult posts a kTypedData copy.
         recv: RecvData,
+        /// Like recv but parses + routes in Zig before posting.
+        /// Posts a route int (RouteId) instead of a Uint8List — zero Dart heap alloc.
+        recv_route: RecvData,
+        /// Fused read+route+write in one async op.
+        /// Phase 1 (write_phase=false): recv into recv_buf.
+        /// Phase 2 (write_phase=true): write static response remainder via SQE/kevent.
+        /// Posts 0 (keep-alive) or -1 (close) to Dart — one await per request.
+        serve: ServeData,
         /// Pre-allocated send buffer embedded in the slot.
         /// Filled by ZigIo_TcpWriteBytes via @memcpy from Dart Uint8List.
         send: SendData,
@@ -40,6 +48,16 @@ pub const CompletionCtx = struct {
 
     pub const RecvData = struct {
         buf: [kBufSize]u8 = undefined,
+    };
+    pub const ServeData = struct {
+        recv_buf: [kBufSize]u8 = undefined,
+        /// Points into http/responses.zig comptime slices — no heap alloc.
+        write_ptr: [*]const u8 = undefined,
+        write_len: usize = 0,
+        /// false = waiting for recv; true = waiting for partial-write remainder.
+        write_phase: bool = false,
+        /// Set after routing: close connection after write completes.
+        should_close: bool = false,
     };
     pub const SendData = struct {
         buf: [kBufSize]u8 = undefined,
@@ -51,6 +69,11 @@ pub const CompletionCtx = struct {
 pub const LoopOps = struct {
     submit_accept: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
     submit_recv: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
+    /// submit_recv_route reuses the same I/O path as submit_recv.
+    /// The op field on the slot distinguishes how the completion is dispatched.
+    submit_recv_route: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
+    /// Fused read+route+write — arms a recv; completion handler routes and writes inline.
+    submit_serve: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
     submit_send: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t, buf: []u8) void,
 };
 
@@ -100,6 +123,16 @@ pub fn freeSlot(pool: *[kPoolSize]CompletionCtx, slots: *SlotAllocator, idx: usi
     pool[idx].in_use = false;
     slots.free_stack[slots.free_len] = @intCast(idx);
     slots.free_len += 1;
+}
+
+/// Post a route integer (recv_route result) directly — no Uint8List, no memcpy.
+/// route < -2 means EOF/error (use RouteId.eof = -3).
+pub fn postRouteResult(port_id: engine.Dart_Port, route: i64) void {
+    var obj = engine.Dart_CObject{
+        .@"type" = engine.Dart_CObject_kInt64,
+        .value = .{ .as_int64 = route },
+    };
+    _ = engine.Dart_PostCObject(port_id, &obj);
 }
 
 /// Post the result of a recv operation to a Dart SendPort.

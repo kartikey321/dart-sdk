@@ -10,6 +10,8 @@ const engine = @import("../engine.zig");
 const state = @import("../zig_io/state.zig");
 const tls_module = @import("../zig_io/tls.zig");
 const profiler = @import("../profiler.zig");
+const http_parser = @import("../http/parser.zig");
+const http_responses = @import("../http/responses.zig");
 
 const notify_user_data: u64 = 1;
 const timeout_user_data: u64 = 2;
@@ -272,6 +274,81 @@ pub const EventLoop = struct {
                 }
                 return true;
             },
+            .recv_route => {
+                // Read completed — parse+route in Zig, post a route int to Dart.
+                // Eliminates Uint8List allocation, ApiMessageSerializer, memcpy, GC pressure.
+                if (cqe.res > 0) {
+                    out.kind = .int_val;
+                    out.int_val = http_parser.routeRequest(ctx.data.recv_route.buf[0..@intCast(cqe.res)]);
+                } else {
+                    out.kind = .int_val;
+                    out.int_val = http_parser.RouteId.eof;
+                }
+                return true;
+            },
+            .serve => {
+                const sd = &ctx.data.serve;
+                const user_data = cqe.user_data; // slot index encoded; reuse for write SQE
+                if (!sd.write_phase) {
+                    // Phase 1: recv SQE completed — route and write inline.
+                    if (cqe.res <= 0) {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    }
+                    const route = http_parser.routeRequest(ctx.data.serve.recv_buf[0..@intCast(cqe.res)]);
+                    sd.should_close = http_responses.shouldClose(route);
+                    const resp = http_responses.forRoute(route) orelse {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    };
+                    // Inline posix.write fast-path — avoids a full io_uring round-trip.
+                    const n = posix.write(ctx.fd, resp) catch {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    };
+                    if (n >= resp.len) {
+                        out.kind = .int_val;
+                        out.int_val = if (sd.should_close) -1 else 0;
+                        return true;
+                    }
+                    // Partial write (rare) — submit write SQE for the remainder.
+                    const start: usize = if (n > 0) n else 0;
+                    sd.write_ptr = resp.ptr + start;
+                    sd.write_len = resp.len - start;
+                    sd.write_phase = true;
+                    _ = self.ring.write(user_data, ctx.fd, sd.write_ptr[0..sd.write_len], 0) catch {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    };
+                    return false; // wait for write SQE completion
+                } else {
+                    // Phase 2: write SQE completed.
+                    if (cqe.res <= 0) {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    }
+                    const written: usize = @intCast(cqe.res);
+                    if (written < sd.write_len) {
+                        // Still partial — resubmit.
+                        sd.write_ptr += written;
+                        sd.write_len -= written;
+                        _ = self.ring.write(user_data, ctx.fd, sd.write_ptr[0..sd.write_len], 0) catch {
+                            out.kind = .int_val;
+                            out.int_val = -1;
+                            return true;
+                        };
+                        return false;
+                    }
+                    out.kind = .int_val;
+                    out.int_val = if (sd.should_close) -1 else 0;
+                    return true;
+                }
+            },
             .send => {
                 // cqe.res is bytes sent (>=0) or -errno.
                 out.kind = .int_val;
@@ -479,6 +556,36 @@ pub const EventLoop = struct {
                 state.postRecvResult(ctx.port_id, cqe.res, ctx.data.recv.buf[0..]);
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
             },
+            .recv_route => {
+                // Legacy path: parse+route in Zig, post int directly.
+                const route: i64 = if (cqe.res > 0)
+                    http_parser.routeRequest(ctx.data.recv_route.buf[0..@intCast(cqe.res)])
+                else
+                    http_parser.RouteId.eof;
+                _ = engine.Dart_PostInteger(ctx.port_id, route);
+                state.freeSlot(self.pool, &self.slot_alloc, idx);
+            },
+            .serve => {
+                // Legacy path: synchronous serve — route then blocking write loop.
+                const sd = &ctx.data.serve;
+                if (cqe.res <= 0) {
+                    _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+                const route = http_parser.routeRequest(sd.recv_buf[0..@intCast(cqe.res)]);
+                const close = http_responses.shouldClose(route);
+                if (http_responses.forRoute(route)) |resp| {
+                    var written: usize = 0;
+                    while (written < resp.len) {
+                        const n = posix.write(ctx.fd, resp[written..]) catch break;
+                        if (n == 0) break;
+                        written += n;
+                    }
+                }
+                _ = engine.Dart_PostInteger(ctx.port_id, if (close) -1 else 0);
+                state.freeSlot(self.pool, &self.slot_alloc, idx);
+            },
             .send => {
                 _ = engine.Dart_PostInteger(ctx.port_id, cqe.res);
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
@@ -567,6 +674,8 @@ pub const EventLoop = struct {
 const uring_ops = state.LoopOps{
     .submit_accept = submitAccept,
     .submit_recv = submitRecv,
+    .submit_recv_route = submitRecvRoute,
+    .submit_serve = submitServe,
     .submit_send = submitSend,
 };
 
@@ -590,6 +699,28 @@ fn submitRecv(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
     // Kernel reads directly into the pool slot's embedded recv buffer — no alloc.
     _ = self.ring.read(user_data, fd, .{ .buffer = ctx.data.recv.buf[0..] }, 0) catch {
         self.postSingleCompletion(ctx.port_id, slot_idx, .null_val, 0, 0);
+        state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
+    };
+}
+
+/// Arm a recv SQE for a serve slot. The completion handler does read+route+write.
+fn submitServe(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
+    const self: *EventLoop = @ptrCast(@alignCast(loop));
+    const ctx = &self.pool[slot_idx];
+    const user_data: u64 = state.kPoolBase + @as(u64, slot_idx);
+    _ = self.ring.read(user_data, fd, .{ .buffer = ctx.data.serve.recv_buf[0..] }, 0) catch {
+        self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
+        state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
+    };
+}
+
+fn submitRecvRoute(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
+    const self: *EventLoop = @ptrCast(@alignCast(loop));
+    const ctx = &self.pool[slot_idx];
+    const user_data: u64 = state.kPoolBase + @as(u64, slot_idx);
+    // Kernel reads directly into recv_route buffer; completion handler routes to an int.
+    _ = self.ring.read(user_data, fd, .{ .buffer = ctx.data.recv_route.buf[0..] }, 0) catch {
+        self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, http_parser.RouteId.eof, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     };
 }

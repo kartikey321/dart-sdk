@@ -71,8 +71,23 @@ else
         echo "export PATH=\"$HOME/depot_tools:\$PATH\"" >> ~/.bashrc
     fi
 
-    # gclient sync (only if out/ReleaseX64 doesn't exist)
+    # gclient sync — write .gclient config if missing, then sync deps
     cd "$SDK/.."
+    if [[ ! -f ".gclient" ]]; then
+        echo "[engine] Writing .gclient config..."
+        cat > .gclient <<'GCLIENT'
+solutions = [
+  {
+    "name": "sdk",
+    "url": "https://dart.googlesource.com/sdk.git",
+    "deps_file": "DEPS",
+    "managed": False,
+    "custom_deps": {},
+    "custom_vars": {},
+  },
+]
+GCLIENT
+    fi
     echo "[engine] Running gclient sync (may take a while)..."
     gclient sync -j"$NPROC" --no-history 2>&1 | tail -5
 

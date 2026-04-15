@@ -28,6 +28,7 @@ abstract final class RouteId {
   static const int ping       =  1; // GET /ping
   static const int notFound   = -1; // valid request, unrecognised path
   static const int badRequest = -2; // malformed or incomplete
+  static const int eof        = -3; // connection closed or read error (recv_route only)
 }
 
 /// Returns a [RouteId] constant — no Dart heap allocation in the hot path.

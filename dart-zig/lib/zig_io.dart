@@ -70,6 +70,12 @@ external void _zigIoTcpAcceptToken(int listenFd, int token);
 @pragma('vm:external-name', 'ZigIo_TcpReadToken')
 external void _zigIoTcpReadToken(int connFd, int maxBytes, int token);
 
+@pragma('vm:external-name', 'ZigIo_TcpServeToken')
+external void _zigIoTcpServeToken(int connFd, int token);
+
+@pragma('vm:external-name', 'ZigIo_TcpReadRouteToken')
+external void _zigIoTcpReadRouteToken(int connFd, int token);
+
 @pragma('vm:external-name', 'ZigIo_TcpWriteBytesToken')
 external void _zigIoTcpWriteBytesToken(int connFd, Uint8List bytes, int token);
 
@@ -119,6 +125,20 @@ Future<Uint8List?> zigIoTcpReadFuture(int connFd, int maxBytes) =>
     _dispatcher
         .submit<Uint8List?>((t) => _zigIoTcpReadToken(connFd, maxBytes, t))
         .then((v) => v as Uint8List?);
+
+/// Fused read+route+write in one async op. Returns 0 (keep-alive) or -1 (close).
+/// One await per request — eliminates one isolate crossing vs read_route + write.
+Future<int> zigIoTcpServeFuture(int connFd) =>
+    _dispatcher
+        .submit<int>((t) => _zigIoTcpServeToken(connFd, t))
+        .then((v) => (v as int?) ?? -1);
+
+/// Read from [connFd], parse+route in Zig. Returns a [RouteId] int.
+/// No Uint8List allocation — bytes are parsed entirely in the Zig completion handler.
+Future<int> zigIoTcpReadRouteFuture(int connFd) =>
+    _dispatcher
+        .submit<int>((t) => _zigIoTcpReadRouteToken(connFd, t))
+        .then((v) => (v as int?) ?? -3); // -3 = RouteId.eof
 
 /// Write [bytes] to [connFd]. Returns bytes written, or -1 on error.
 Future<int> zigIoTcpWriteBytesFuture(int connFd, Uint8List bytes) =>
