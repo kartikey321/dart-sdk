@@ -17,11 +17,11 @@ PERF-4 (serve op):  ~178k req/s   (1 await/request, 0 heap allocs)
 Phase 14 baseline:  ~159k req/s   (3 awaits/request, batch dispatcher)
 ```
 
-**Linux VPS 6-core (io_uring, multi-worker, taskset CPU-pinned) — pre-PERF-4:**
+**Linux VPS 6-core (io_uring, ReleaseFast, taskset CPU-pinned):**
 ```
-1 worker  (core 0):      ~37k req/s
-3 workers (cores 0–2):  ~126k req/s   (3.4× — near-linear)
-6 workers:               TBD post PERF-4
+              Before (Phase 14)   After (PERF-4)   Gain
+1 worker:          ~37k req/s       ~92k req/s      2.5×
+3 workers:        ~126k req/s      ~196k req/s      1.6×
 ```
 
 ---
@@ -291,6 +291,13 @@ dart-zig/
 | PERF-2 | ZigHttp_RouteRequest          | ~163k _(est.)_          |
 | PERF-3 | recv_route op                 | ~170k _(est.)_          |
 | **PERF-4** | **Fused serve op**        | **~178k**               |
+
+### Linux VPS, 6-core, io_uring, taskset CPU-pinned, ReleaseFast
+
+| Phase  | 1 worker | 3 workers | Notes |
+|--------|----------:|----------:|-------|
+| 14     | ~37k     | ~126k     | 3.4× scaling |
+| **PERF-4** | **~92k** | **~196k** | **2.5× single-worker gain** |
 
 ### Linux VPS, 6-core, io_uring, taskset CPU-pinned
 

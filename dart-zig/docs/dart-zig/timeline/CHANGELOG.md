@@ -16,7 +16,13 @@ Phase-by-phase development log. Benchmarks run with `wrk -t4 -c128 -d10s` unless
 - `zigIoTcpServeFuture(connFd)` in `zig_io.dart`: posts 0 (keep-alive) or −1 (close)
 - `http_server.dart` reduced to 55 lines — hot path is a single `await zigIoTcpServeFuture(connFd)`
 
-**Result:**
+**Result (Linux VPS, 6-core, io_uring, ReleaseFast, taskset CPU-pinned):**
+
+| Config | Before (Phase 14) | After (PERF-4) | Gain |
+|--------|------------------:|---------------:|-----:|
+| 1 worker, core 0 | ~37k req/s | **92k req/s** | **2.5×** |
+| 3 workers, cores 0–2 | ~126k req/s | **196k req/s** | **1.6×** |
+
 - Per-request await count: **3 → 1**
 - Per-request Dart heap allocation: **2 → 0** (no Uint8List, no response copy)
 - Isolate crossings per request: **3 → 1**
@@ -59,12 +65,13 @@ Note: PERF-4 (serve op) supersedes this for the hot path. recv_route remains ava
 
 **Fix:** CPU pinning with `taskset -c` on Linux VPS separates server and client cores.
 
-**Linux VPS results (6-core, io_uring, taskset separated):**
+**Linux VPS results (6-core, io_uring, taskset separated, pre-PERF-4):**
 | Workers | Cores (server) | req/sec |
 |---------|---------------|---------|
 | 1       | 0             | ~37k    |
 | 3       | 0–2           | ~126k   |
-| 6       | 0–2           | TBD (post PERF-4) |
+
+See PERF-4 for post-optimization numbers (92k / 196k).
 
 Linear scaling confirmed (3.4× on 3 cores). Architecture is correct.
 

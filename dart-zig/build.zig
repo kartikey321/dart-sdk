@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
     if (builtin.os.tag == .linux) {
         // pthread_create is a weak symbol in glibc — must explicitly link pthreads
         // so libdart_engine_jit_shared.so sees a non-null pthread_create at startup.
-        exe.root_module.linkLibC();
+        exe.root_module.linkSystemLibrary("c", .{}); // linkLibC() removed in Zig 0.16
         exe.root_module.linkSystemLibrary("pthread", .{});
     } else if (builtin.os.tag == .macos) {
         exe.root_module.linkFramework("CoreFoundation", .{});
