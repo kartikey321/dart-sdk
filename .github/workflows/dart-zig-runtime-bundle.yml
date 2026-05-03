@@ -63,6 +63,11 @@ jobs:
           python3 tools/build.py --mode=release --arch=x64 -j"$(nproc)" \
             dart_engine_jit_shared dart_engine_aot_shared dart gen_snapshot
 
+      - name: Build BoringSSL static libraries
+        run: |
+          chmod +x dart-zig/scripts/build_boringssl.sh
+          dart-zig/scripts/build_boringssl.sh
+
       - name: Package runtime bundle
         run: |
           chmod +x dart-zig/scripts/package_runtime_bundle.sh
