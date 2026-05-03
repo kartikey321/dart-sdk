@@ -81,7 +81,7 @@ phase_build_engine() {
   log phase "build Dart engine prerequisites"
   pushd "${REPO_ROOT}" >/dev/null
   python3 tools/build.py --mode=release --arch=x64 -j"${JOBS}" \
-    dart_engine_jit_shared dart_engine_aot_shared dart gen_snapshot
+    dartvm dart_engine_jit_shared dart_engine_aot_shared dart gen_snapshot
   popd >/dev/null
 }
 

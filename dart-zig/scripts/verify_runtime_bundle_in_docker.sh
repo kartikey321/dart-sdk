@@ -56,7 +56,7 @@ zig version
 
 cd ${CONTAINER_REPO}
 python3 tools/build.py --mode=release --arch=x64 -j${JOBS} \
-  dart_engine_jit_shared dart_engine_aot_shared dart gen_snapshot
+  dartvm dart_engine_jit_shared dart_engine_aot_shared dart gen_snapshot
 
 chmod +x dart-zig/scripts/build_boringssl.sh
 chmod +x dart-zig/scripts/package_runtime_bundle.sh
