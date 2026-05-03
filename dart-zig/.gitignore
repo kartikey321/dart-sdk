@@ -3,6 +3,7 @@
 .zig-global-cache-linux/
 zig-out/
 zig-out-linux/
+dist/
 test-snapshots/*.dill
 test-snapshots/*.dylib
 test-snapshots/*.so

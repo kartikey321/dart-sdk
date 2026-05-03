@@ -1,0 +1,75 @@
+name: dart-zig runtime bundle
+
+on:
+  push:
+    branches:
+      - dart-zig
+    paths:
+      - 'dart-zig/**'
+      - 'runtime/engine/**'
+      - '.github/workflows/dart-zig-runtime-bundle.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-bundle:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl git python3 pkg-config cmake ninja-build \
+            liburing-dev ca-certificates
+
+      - name: Install Zig 0.15.2
+        run: |
+          curl -fL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o /tmp/zig.tar.xz
+          sudo tar -xf /tmp/zig.tar.xz -C /opt/
+          sudo ln -sf /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
+          zig version
+
+      - name: Build Dart engine prerequisites
+        run: |
+          python3 tools/build.py --mode=release --arch=x64 -j"$(nproc)" \
+            dart_engine_jit_shared dart_engine_aot_shared dart gen_snapshot
+
+      - name: Package runtime bundle
+        run: |
+          chmod +x dart-zig/scripts/package_runtime_bundle.sh
+          dart-zig/scripts/package_runtime_bundle.sh
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dart-zig-linux-x64
+          path: |
+            dart-zig/dist/dart-zig-linux-x64
+            dart-zig/dist/dart-zig-linux-x64.tar.gz
+          if-no-files-found: error
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push GHCR runtime image
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/dart-zig-runtime
+        run: |
+          docker build \
+            -f dart-zig/docker/Dockerfile.runtime-base \
+            -t "${IMAGE_NAME}:sha-${GITHUB_SHA}" \
+            -t "${IMAGE_NAME}:latest" \
+            dart-zig/dist
+          docker push "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          docker push "${IMAGE_NAME}:latest"

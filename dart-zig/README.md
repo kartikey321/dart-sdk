@@ -166,6 +166,58 @@ If the goal is full `dart:io` replacement, that is a larger follow-on project.
 The current codebase should be understood first as a server runtime and native
 I/O platform for Dart.
 
+## Runtime Bundle
+
+`dart-zig` now has a reusable Linux runtime bundle path, plus one bundled
+reference benchmark HTTP app for external harnesses such as HttpArena:
+
+- package script:
+  `dart-zig/scripts/package_runtime_bundle.sh`
+- base image Dockerfile:
+  `dart-zig/docker/Dockerfile.runtime-base`
+- reference benchmark app:
+  `dart-zig/lib/benchmark_http_server.dart`
+- CI workflow:
+  `.github/workflows/dart-zig-runtime-bundle.yml`
+
+Bundle contents:
+
+- `bin/dart-zig`
+- `bin/dart-zig-aot`
+- `lib/libdart_engine_jit_shared.so`
+- `lib/libdart_engine_aot_shared.so`
+- `snapshots/benchmark_http_server.dill`
+- `snapshots/benchmark_http_server_aot.so`
+
+Naming model:
+
+- the runtime artifact is generic: `dart-zig-linux-x64`
+- the bundled Dart snapshot is only a reference app, not the product identity
+- HttpArena is one consumer of this distribution path, not the definition of it
+
+Important Linux container constraint:
+
+- Docker's default seccomp profile blocks `io_uring_setup`
+- `dart-zig` containers must run with
+  `--security-opt seccomp=unconfined`
+  or an equivalent custom seccomp profile that allows
+  `io_uring_setup`, `io_uring_enter`, and `io_uring_register`
+
+Validated local smoke test:
+
+```sh
+bash dart-zig/scripts/package_runtime_bundle.sh
+sudo docker build \
+  -f dart-zig/docker/Dockerfile.runtime-base \
+  -t dart-zig-runtime:local \
+  dart-zig/dist
+sudo docker run --rm \
+  --security-opt seccomp=unconfined \
+  -p 8080:8080 \
+  dart-zig-runtime:local \
+  /opt/dart-zig/bin/dart-zig /opt/dart-zig/snapshots/benchmark_http_server.dill 8080
+```
+
 ---
 
 ## Prerequisites
