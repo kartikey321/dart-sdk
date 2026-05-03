@@ -37,10 +37,11 @@ jobs:
       - name: Bootstrap SDK dependencies
         working-directory: ${{ github.workspace }}/..
         run: |
+          ln -sfn dart-sdk sdk
           cat > .gclient <<'EOF'
           solutions = [
             {
-              "name": "dart-sdk",
+              "name": "sdk",
               "url": "https://dart.googlesource.com/sdk.git",
               "managed": False,
               "custom_deps": {},
