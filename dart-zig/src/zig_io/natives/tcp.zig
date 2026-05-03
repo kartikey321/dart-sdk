@@ -137,7 +137,7 @@ pub fn ZigIo_TcpAcceptToken(args: engine.Dart_NativeArguments) callconv(.c) void
     ctx.port_id = token;
     ctx.fd = @intCast(fd_val);
     ctx.tls_id = 0;
-    ctx.data = .{ .accept = {} };
+    ctx.data = .{ .accept = .{ .listen_fd = @intCast(fd_val) } };
     if (profiler.enabled) profiler.p.onNativePost();
     loop.ops.submit_accept(loop.ptr, idx, @intCast(fd_val));
 }
@@ -268,9 +268,13 @@ pub fn ZigIo_TcpWriteBytesToken(args: engine.Dart_NativeArguments) callconv(.c) 
     var data_ptr: ?*anyopaque = null;
     var data_len: isize = 0;
     const acq = engine.Dart_TypedDataAcquireData(list, &data_type, &data_ptr, &data_len);
-    if (engine.Dart_IsError(acq) or data_ptr == null) {
+    if (engine.Dart_IsError(acq)) {
+        // AcquireData failed — must NOT call ReleaseData.
+        if (state.current_loop) |loop| postTokenInt(loop, token, -1);
+        return;
+    }
+    if (data_ptr == null) {
         _ = engine.Dart_TypedDataReleaseData(list);
-        // Acquire failed (not a typed-data object, or VM error).
         if (state.current_loop) |loop| postTokenInt(loop, token, -1);
         return;
     }
@@ -331,7 +335,7 @@ pub fn ZigIo_TcpAccept(args: engine.Dart_NativeArguments) callconv(.c) void {
     ctx.port_id = port_id;
     ctx.fd = @intCast(fd_val);
     ctx.tls_id = 0;
-    ctx.data = .{ .accept = {} };
+    ctx.data = .{ .accept = .{ .listen_fd = @intCast(fd_val) } };
 
     if (profiler.enabled) profiler.p.onNativePost();
     loop.ops.submit_accept(loop.ptr, idx, @intCast(fd_val));
@@ -439,7 +443,12 @@ pub fn ZigIo_TcpWriteBytes(args: engine.Dart_NativeArguments) callconv(.c) void 
     var data_ptr: ?*anyopaque = null;
     var data_len: isize = 0;
     const acq = engine.Dart_TypedDataAcquireData(list, &data_type, &data_ptr, &data_len);
-    if (engine.Dart_IsError(acq) or data_ptr == null or data_len <= 0) {
+    if (engine.Dart_IsError(acq)) {
+        // AcquireData failed — must NOT call ReleaseData.
+        _ = engine.Dart_PostInteger(port_id, -1);
+        return;
+    }
+    if (data_ptr == null or data_len <= 0) {
         _ = engine.Dart_TypedDataReleaseData(list);
         _ = engine.Dart_PostInteger(port_id, if (data_len <= 0) 0 else -1);
         return;

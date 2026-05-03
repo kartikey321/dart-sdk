@@ -32,7 +32,7 @@ import 'zig_io.dart';
 
 Future<void> _handleConn(int connFd) async {
   await zigIoTcpLoopFuture(connFd);
-  zigIoClose(connFd);
+  // fd already closed by Zig before posting -1
 }
 
 // ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ Future<void> _handleConn(int connFd) async {
 Future<void> main(List<String> args) async {
   final port = args.isNotEmpty ? int.parse(args[0]) : 8080;
 
-  final listenFd = zigIoTcpBind('0.0.0.0', port, 128);
+  final listenFd = zigIoTcpBind('0.0.0.0', port, 4096);
   if (listenFd < 0) {
     print('bind failed: $listenFd');
     return;

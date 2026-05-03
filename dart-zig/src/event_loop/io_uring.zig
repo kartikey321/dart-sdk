@@ -33,9 +33,15 @@ pub const EventLoop = struct {
     /// When non-zero, completions are batched into one CObject_kArray per
     /// copy_cqes() call instead of N individual Dart_PostInteger/PostCObject calls.
     batch_port_id: engine.Dart_Port = 0,
+    /// Set when armNotifyRead() fails because the SQ is full (256 recv re-arms
+    /// from 256 op.loop connections can exactly fill a 256-slot SQ). Retried
+    /// at the top of the next submit_and_wait iteration after the SQ drains.
+    notify_needs_rearm: bool = false,
 
     pub fn init(isolate: engine.DartHandle) !EventLoop {
-        var ring = try linux.IoUring.init(256, 0);
+        // SQ size 4096: prevents overflow when 256 op.loop connections each
+        // re-arm a recv SQE across 8 copy_cqes() passes (256 SQEs) plus notify.
+        var ring = try linux.IoUring.init(4096, 0);
         errdefer ring.deinit();
 
         const notify_fd = try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
@@ -137,6 +143,13 @@ pub const EventLoop = struct {
         while (true) {
             _ = self.ring.submit_and_wait(1) catch break;
 
+            // Retry deferred notify re-arm now that submit_and_wait has drained
+            // the SQ. Keep the flag set if it fails again (retry next iteration).
+            if (self.notify_needs_rearm) {
+                self.notify_needs_rearm = false;
+                self.armNotifyRead() catch { self.notify_needs_rearm = true; };
+            }
+
             // Track whether any pool I/O fired this iteration.
             // Used to suppress Dart_NotifyIdle when the loop is actively processing
             // connections (timeout CQE can arrive in the same batch as pool CQEs).
@@ -157,32 +170,30 @@ pub const EventLoop = struct {
                     const cqe = cqes[i];
 
                     if (cqe.user_data == notify_user_data) {
-                        // Drain a snapshot of pending messages while keeping pending>0.
-                        // This suppresses extra eventfd writes during the drain:
-                        // schedule_callback only writes on 0->1 transitions.
-                        const count: i32 = @intCast(@max(1, self.pending.load(.acquire)));
-                        var processed: i32 = 0;
-                        while (processed < count) : (processed += 1) {
-                            if (self.isolate != null) {
-                                engine.DartEngine_HandleMessage(self.isolate);
+                        // Drain all pending scheduler callbacks before re-arming eventfd.
+                        while (true) {
+                            const count: i32 = @intCast(@max(1, self.pending.swap(0, .acq_rel)));
+                            var processed: i32 = 0;
+                            while (processed < count) : (processed += 1) {
+                                if (self.isolate != null) {
+                                    engine.DartEngine_HandleMessage(self.isolate);
+                                }
                             }
-                        }
-                        // Drain microtask queue so async continuations run.
-                        if (self.isolate != null) {
-                            engine.DartEngine_AcquireIsolate(self.isolate);
-                            engine.Dart_EnterScope();
-                            _ = engine.DartEngine_DrainMicrotasksQueue();
-                            engine.Dart_ExitScope();
-                            engine.DartEngine_ReleaseIsolate();
-                        }
-                        const old_pending = self.pending.fetchSub(count, .acq_rel);
-                        const remaining: i32 = if (old_pending > count) old_pending - count else 0;
-                        if (remaining > 0) {
-                            const one: u64 = 1;
-                            _ = posix.write(self.notify_fd, std.mem.asBytes(&one)) catch {};
+                            // Drain microtask queue so async continuations run.
+                            if (self.isolate != null) {
+                                engine.DartEngine_AcquireIsolate(self.isolate);
+                                engine.Dart_EnterScope();
+                                _ = engine.DartEngine_DrainMicrotasksQueue();
+                                engine.Dart_ExitScope();
+                                engine.DartEngine_ReleaseIsolate();
+                            }
+                            if (self.pending.load(.acquire) == 0) break;
                         }
                         self.notify_buf = 0;
-                        self.armNotifyRead() catch {};
+                        self.armNotifyRead() catch {
+                            // SQ full — retry at top of next submit_and_wait iteration.
+                            self.notify_needs_rearm = true;
+                        };
                     } else if (cqe.user_data == signal_user_data) {
                         // SIGINT or SIGTERM — graceful shutdown.
                         // Flush any pending batch so in-flight completions are delivered
@@ -391,6 +402,7 @@ pub const EventLoop = struct {
                 if (!sd.write_phase) {
                     // Recv SQE completed — accumulate and run pipeline loop.
                     if (cqe.res <= 0) {
+                        posix.close(ctx.fd);
                         out.kind = .int_val;
                         out.int_val = -1;
                         return true;
@@ -399,16 +411,18 @@ pub const EventLoop = struct {
                 } else {
                     // Write SQE completed — advance buffer, clear write_phase.
                     if (cqe.res <= 0) {
+                        posix.close(ctx.fd);
                         out.kind = .int_val;
                         out.int_val = -1;
                         return true;
                     }
                     const written: usize = @intCast(cqe.res);
                     if (written < sd.write_len) {
-                        // Still partial — resubmit write SQE.
+                        // Still partial — resubmit send SQE.
                         sd.write_ptr += written;
                         sd.write_len -= written;
-                        _ = self.ring.write(user_data, ctx.fd, sd.write_ptr[0..sd.write_len], 0) catch {
+                        _ = self.ring.send(user_data, ctx.fd, sd.write_ptr[0..sd.write_len], linux.MSG.NOSIGNAL) catch {
+                            posix.close(ctx.fd);
                             out.kind = .int_val;
                             out.int_val = -1;
                             return true;
@@ -416,6 +430,7 @@ pub const EventLoop = struct {
                         return false;
                     }
                     if (sd.should_close) {
+                        posix.close(ctx.fd);
                         out.kind = .int_val;
                         out.int_val = -1;
                         return true;
@@ -429,6 +444,7 @@ pub const EventLoop = struct {
                 }
                 // Run pipelining loop.
                 if (self.processLoopPipeline(idx)) |val| {
+                    posix.close(ctx.fd);
                     out.kind = .int_val;
                     out.int_val = val;
                     return true;
@@ -629,36 +645,21 @@ pub const EventLoop = struct {
                 // Need more data — resubmit recv SQE into remaining buffer space.
                 const space = sd.recv_buf[sd.recv_len..];
                 if (space.len == 0) return -1; // buffer full — close
-                _ = self.ring.read(user_data, ctx.fd, .{ .buffer = space }, 0) catch return -1;
+                _ = self.ring.recv(user_data, ctx.fd, .{ .buffer = space }, 0) catch return -1;
                 return null;
             }
             const resp = http_responses.forRoute(rr.route) orelse return -1;
             const close = http_responses.shouldClose(rr.route);
-            // Inline posix.write fast-path.
-            const n = posix.write(ctx.fd, resp) catch return -1;
-            if (n < resp.len) {
-                // Partial write — submit write SQE for remainder.
-                sd.write_ptr = resp.ptr + n;
-                sd.write_len = resp.len - n;
-                sd.write_phase = true;
-                sd.should_close = close;
-                sd.pending_consumed = rr.consumed;
-                _ = self.ring.write(user_data, ctx.fd, sd.write_ptr[0..sd.write_len], 0) catch return -1;
-                return null;
-            }
-            if (close) return -1;
-            // Advance buffer past consumed request.
-            const remaining = sd.recv_len - rr.consumed;
-            if (remaining > 0) {
-                std.mem.copyForwards(u8, sd.recv_buf[0..remaining], sd.recv_buf[rr.consumed..sd.recv_len]);
-            }
-            sd.recv_len = remaining;
-            if (remaining == 0) {
-                // Buffer empty — resubmit recv for next request.
-                _ = self.ring.read(user_data, ctx.fd, .{ .buffer = sd.recv_buf[0..] }, 0) catch return -1;
-                return null;
-            }
-            // Pipelined request available — loop immediately.
+            // Submit send SQE — socket path, bypasses VFS layer.
+            // io_uring batches all pending sends in one enter().
+            sd.write_ptr = resp.ptr;
+            sd.write_len = resp.len;
+            sd.write_phase = true;
+            sd.should_close = close;
+            sd.pending_consumed = rr.consumed;
+            _ = self.ring.send(user_data, ctx.fd, sd.write_ptr[0..sd.write_len], linux.MSG.NOSIGNAL) catch return -1;
+            return null;
+            // (pipelining: write CQE handler calls processLoopPipeline again)
         }
     }
 
@@ -716,7 +717,11 @@ pub const EventLoop = struct {
                             ctx.fd,
                             .{ .buffer = space },
                             0,
-                        ) catch {};
+                        ) catch {
+                            _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                            state.freeSlot(self.pool, &self.slot_alloc, idx);
+                            return;
+                        };
                     } else {
                         _ = engine.Dart_PostInteger(ctx.port_id, -1);
                         state.freeSlot(self.pool, &self.slot_alloc, idx);
@@ -751,7 +756,11 @@ pub const EventLoop = struct {
                         // Need more data — resubmit recv.
                         const space = sd.recv_buf[sd.recv_len..];
                         if (space.len > 0) {
-                            _ = self.ring.read(state.kPoolBase + @as(u64, idx), ctx.fd, .{ .buffer = space }, 0) catch {};
+                            _ = self.ring.read(state.kPoolBase + @as(u64, idx), ctx.fd, .{ .buffer = space }, 0) catch {
+                                _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                                state.freeSlot(self.pool, &self.slot_alloc, idx);
+                                return;
+                            };
                         } else {
                             _ = engine.Dart_PostInteger(ctx.port_id, -1);
                             state.freeSlot(self.pool, &self.slot_alloc, idx);
@@ -779,7 +788,11 @@ pub const EventLoop = struct {
                     sd.recv_len = remaining;
                     if (remaining == 0) {
                         // Buffer empty — resubmit recv for next request.
-                        _ = self.ring.read(state.kPoolBase + @as(u64, idx), ctx.fd, .{ .buffer = sd.recv_buf[0..] }, 0) catch {};
+                        _ = self.ring.read(state.kPoolBase + @as(u64, idx), ctx.fd, .{ .buffer = sd.recv_buf[0..] }, 0) catch {
+                            _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                            state.freeSlot(self.pool, &self.slot_alloc, idx);
+                            return;
+                        };
                         return;
                     }
                 }
@@ -884,8 +897,6 @@ fn submitAccept(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
     const user_data: u64 = state.kPoolBase + @as(u64, slot_idx);
     const accept_flags: u32 = linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
     _ = self.ring.accept(user_data, fd, null, null, accept_flags) catch {
-        // SQE submission failed — post error immediately so the Dart future
-        // (or raw port) completes rather than hanging indefinitely.
         self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     };
@@ -918,7 +929,7 @@ fn submitLoop(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
     const self: *EventLoop = @ptrCast(@alignCast(loop));
     const ctx = &self.pool[slot_idx];
     const user_data: u64 = state.kPoolBase + @as(u64, slot_idx);
-    _ = self.ring.read(user_data, fd, .{ .buffer = ctx.data.loop.recv_buf[0..] }, 0) catch {
+    _ = self.ring.recv(user_data, fd, .{ .buffer = ctx.data.loop.recv_buf[0..] }, 0) catch {
         self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     };

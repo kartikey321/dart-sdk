@@ -139,21 +139,50 @@ pub const RouteResult = struct {
     consumed: usize,
 };
 
-/// Like routeRequest() but also returns how many bytes were consumed.
-/// After writing the response, shift recv_buf[consumed..] to front and try routing again
-/// to handle pipelined requests without re-arming recv.
+/// Fast path: extract path and find body_offset WITHOUT parsing individual headers.
+/// Skips all header name/value iteration — ~3x less work than parse() for typical requests.
 pub fn routeRequestFull(buf: []const u8) RouteResult {
-    const r = parse(buf);
-    if (r.status == .incomplete) return .{ .route = RouteId.incomplete, .consumed = 0 };
-    if (r.status != .complete) return .{ .route = RouteId.bad_request, .consumed = 0 };
-    const path = r.path;
-    const route: i64 = if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html"))
+    var i: usize = 0;
+
+    // Skip method (up to first space).
+    while (i < buf.len and buf[i] != ' ') : (i += 1) {}
+    if (i >= buf.len) return .{ .route = RouteId.incomplete, .consumed = 0 };
+    i += 1; // skip space
+
+    // Read path (up to next space or CR/LF — handles HTTP/0.9).
+    const path_start = i;
+    while (i < buf.len and buf[i] != ' ' and buf[i] != '\r' and buf[i] != '\n') : (i += 1) {}
+    if (i >= buf.len) return .{ .route = RouteId.incomplete, .consumed = 0 };
+    const raw_path = buf[path_start..i];
+
+    // Strip query string for routing.
+    const path = if (std.mem.indexOfScalar(u8, raw_path, '?')) |q| raw_path[0..q] else raw_path;
+
+    const route: i64 = if (path.len == 1 and path[0] == '/')
         RouteId.hello
-    else if (std.mem.eql(u8, path, "/ping"))
+    else if (path.len == 12 and std.mem.eql(u8, path, "/index.html"))
+        RouteId.hello
+    else if (path.len == 5 and std.mem.eql(u8, path, "/ping"))
         RouteId.ping
     else
         RouteId.not_found;
-    return .{ .route = route, .consumed = r.body_offset };
+
+    // Skip to end of request line.
+    while (i < buf.len and buf[i] != '\n') : (i += 1) {}
+    if (i >= buf.len) return .{ .route = RouteId.incomplete, .consumed = 0 };
+    i += 1; // skip LF
+
+    // Single-pass scan for blank line: \r\n\r\n or \n\n — no per-header parsing.
+    while (i < buf.len) : (i += 1) {
+        if (buf[i] == '\r') {
+            if (i + 3 < buf.len and buf[i + 1] == '\n' and buf[i + 2] == '\r' and buf[i + 3] == '\n')
+                return .{ .route = route, .consumed = i + 4 };
+        } else if (buf[i] == '\n') {
+            if (i + 1 < buf.len and buf[i + 1] == '\n')
+                return .{ .route = route, .consumed = i + 2 };
+        }
+    }
+    return .{ .route = RouteId.incomplete, .consumed = 0 };
 }
 
 /// Parse the request in `buf` and return a RouteId integer.

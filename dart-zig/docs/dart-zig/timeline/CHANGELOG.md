@@ -2,6 +2,231 @@
 
 ---
 
+## Phase 18 — Bug fixes, perf profiling, AOT HttpServer, `req.path` optimisation (2026-05-03)
+
+### Bug fixes (`src/event_loop/io_uring.zig`, `src/zig_io/natives/tcp.zig`)
+
+Three production-correctness issues found via code audit and fixed:
+
+**1. Invalid `Dart_TypedDataReleaseData` after failed `AcquireData` (tcp.zig)**
+`ZigIo_TcpWriteBytesToken` and `ZigIo_TcpWriteBytes` both called `ReleaseData` unconditionally
+even when `AcquireData` returned an error. Calling Release without a matching Acquire
+corrupts Dart VM WeakTable state and could destabilise the heap.
+Fix: check `Dart_IsError(acq)` first; only call `ReleaseData` when acquisition succeeded.
+
+**2. Pool slot leak on SQ-full in legacy `.serve` / `.loop` dispatch (io_uring.zig)**
+In `dispatchPoolCqe`, the resubmit `ring.read(...)` calls for incomplete HTTP requests used
+`catch {}` — silently swallowing SQ-full errors and leaving the pool slot permanently
+in-use. Under sustained high-connection load the 4096-slot pool would exhaust, causing
+every new native I/O call to fail with `-1`.
+Fix: on `ring.read` failure, post `-1` to the Dart port and free the slot immediately.
+Three sites patched: `.serve` incomplete recv, `.loop` incomplete recv, `.loop` empty-buffer
+resubmit.
+
+**Note on CQ overflow:** Zig's `copy_cqes` already handles `IORING_SQ_CQ_OVERFLOW` — when
+the flag is set it calls `io_uring_enter(GETEVENTS)` before returning, flushing the kernel
+overflow list back to the CQ ring. No additional handling needed.
+
+### `ZigHttpServer` — `req.path` fast-path + AOT compilation
+
+**`req.path` property (lib/zig_http_server.dart)**
+
+Added direct `path` field to `ZigHttpRequest`; `uri` is now lazy:
+```dart
+class ZigHttpRequest {
+  final String path;        // raw path string — no allocation cost
+  Uri get uri => _uri ??= Uri.parse(path);  // lazy, only when query params needed
+}
+```
+Handlers that only need the path (the common case) no longer trigger `Uri.parse()` on every
+request. perf profile confirmed `Dart_NewStringFromUTF8` (0.27% of samples in JIT) was the
+`Uri.parse` allocation; it is absent from the AOT profile after this change.
+
+Updated `zig_http_server_example.dart` to use `switch (req.path)` instead of
+`switch (req.uri.path)`.
+
+**AOT snapshot**
+
+ZigHttpServer is now compiled and benchmarked as AOT ELF:
+```sh
+dart pkg/vm/bin/gen_kernel.dart --aot -o example_aot.dill example.dart
+gen_snapshot --snapshot-kind=app-aot-elf --elf=example.so example_aot.dill
+./dart-zig-aot example.so 9091
+```
+
+**Benchmark (`wrk -t4 -c100 -d10s`, Linux VPS, 1 worker):**
+```
+ZigHttpServer JIT (before req.path fix):   ~36.5k req/s
+ZigHttpServer AOT (after req.path fix):    ~35.9k req/s  (consistent, low jitter)
+Op.loop AOT (zero-Dart path):              ~130k  req/s
+dart:io AOT:                               ~9.9k  req/s
+```
+AOT is slightly lower than warmed JIT in raw req/s but has much better tail latency:
+- JIT: 3.5ms avg ± 6ms (GC pauses visible)
+- AOT: 2.8ms avg ± 1.1ms (no JIT compilation GC spikes)
+
+### perf profile — ZigHttpServer JIT vs AOT
+
+**JIT flat profile (top named symbols):**
+```
+ 1.90%  libc write                          ← actual TCP send
+ 1.34%  pthread_mutex_lock                  ← Dart VM internal locking per completion
+ 1.02%  NativeEntry::AutoScopeNativeCallWrapper  ← every @pragma native entry overhead
+ 0.94%  Scavenger::TryAllocateNewTLAB       ← per-request GC allocation
+ 0.94%  pthread_mutex_unlock
+ 0.63%  malloc
+ 0.40%  ApiMessageSerializer::Serialize     ← batch CQE→Dart message packing
+ 0.27%  Dart_NewStringFromUTF8              ← Uri.parse() (eliminated by req.path)
+ 0.23%  ZigHttp_Parse                       ← our HTTP parser (tiny — good)
+ 0.29%  ZigIo_TcpReadToken / 0.27% ZigIo_TcpWriteBytesToken
+```
+Profile is fragmented — no single hot function. Server was spending ~5% in kernel
+(`io_uring_enter`), with the rest scattered across Dart VM machinery. Compare to Op.loop
+which spends 96% in `io_uring_enter` (pure I/O wait).
+
+**AOT flat profile (top named symbols, reveals actual Dart hotspots):**
+```
+ 1.59%  libc write
+ 1.55%  _Utf8Encoder._fillBuffer            ← utf8.encode() for HTTP header bytes
+ 1.26%  Future._propagateToListeners        ← async await/completion chain
+ 1.20%  pthread_mutex_lock
+ 1.05%  stub AwaitStub                      ← suspend cost per await
+ 1.01%  stub AllocateClosure1Stub           ← async continuation allocation
+ 0.99%  stub AllocateObjectParameterizedStub ← ZigHttpRequest/Response alloc
+ 0.93%  stub AllocateUint8ArrayStub         ← recv buffer copies
+ 0.87%  stub AllocateContextStub            ← captured-variable context per conn
+ 0.85%  String._concatAll                   ← header string interpolation
+ 0.78%  AutoScopeNativeCallWrapper          (↓ vs JIT — no JIT recompile overhead)
+ 0.74%  _StringBase._interpolate            ← '$name: $value\r\n' in header loop
+ 0.52%  ZigHttpResponse.close               ← response building
+ 0.47%  ZigHttpServer._handleConnection
+ 0.45%  Scavenger::TryAllocateNewTLAB       (↓ vs JIT)
+ 0.39%  _LinkedHashMapMixin._insert/_remove ← ZigHeaders Map per response
+```
+
+**AOT profile key findings:**
+- `Uri.parse` is **gone** from AOT profile (eliminated by `req.path`)
+- `_Utf8Encoder._fillBuffer` (1.55%) — `utf8.encode()` for HTTP header bytes is now the
+  #2 hotspot. Pre-building static header byte sequences would reduce this.
+- String interpolation (`$name: $value\r\n`) in the header loop: 0.85%+0.74% = 1.59%
+  combined. Pre-computing `content-type` / `content-length` prefix bytes would help.
+- `ZigHeaders` HashMap insert/remove (0.78%) — for default headers that are always set,
+  a flat array would be faster.
+- Allocation stubs dominate (>4% combined): async closures, contexts, Uint8Arrays.
+  Per-request object count is high; a connection-scoped buffer pool could reduce GC.
+
+**`close()` prod-correctness fix**
+`content-type` and `connection` were set with `_set` (unconditional overwrite), silently
+discarding any value the handler set via `response.headers.set(...)`. Changed both to
+`_setIfAbsent` so handler-set values are respected. `content-length` was already `_setIfAbsent`.
+
+**Status line cache (safe optimisation applied)**
+Replaced `'HTTP/1.1 $statusCode ${_statusText(statusCode)}\r\n'` string interpolation with
+a `static const Map<int, String>` of pre-built status lines. Eliminates `String._concatAll`
+for all common status codes. Unknown codes fall back to interpolation.
+
+**Deferred optimisations — prod-breaking, do not apply before release:**
+
+| Optimisation | Why deferred |
+|---|---|
+| Pre-build `content-type: text/plain…\r\n` bytes | Bypasses `headers.set('content-type', …)` override |
+| Pre-build `connection: keep-alive\r\n` bytes | Bypasses `headers.set('connection', 'close')` override |
+| Remove `ZigHeaders` from default-header path | Breaks all user custom headers |
+| Inline ASCII digit loop for `content-length` | Breaks `headers.set('content-length', …)` override |
+| Replace `ZigHeaders` Map with flat array | API-breaking — removes `headers[name]` lookup |
+
+The remaining profile hotspots (`Future._propagateToListeners`, `AwaitStub`, `AllocateClosure1Stub`,
+`AllocateContextStub`) are structural costs of 2 Dart awaits/request and cannot be reduced
+without changing the abstraction itself.
+
+---
+
+## Phase 17 — HttpServer abstraction + io_uring async send + perf audit (2026-05-03)
+
+### ZigHttpServer abstraction (`lib/zig_http_server.dart`)
+
+New `ZigHttpServer` class providing a dart:io-compatible API over dart-zig's io_uring backend:
+
+```dart
+final server = await ZigHttpServer.bind('0.0.0.0', 8080);
+server.stream.listen((req) {
+  req.response
+    ..statusCode = 200
+    ..write('Hello!')
+    ..close();
+});
+```
+
+**Design:**
+- `ZigHttpServer.bind()` → calls `zigIoTcpBind` (Zig), returns server object
+- Accept loop: `zigIoTcpAcceptFuture` per connection (io_uring accept SQE)
+- Per-connection: 8 KB stack buffer, accumulates until `parseHttpRequest` (ZigHttp_Parse native) succeeds
+- Response: `ZigHttpResponse` builds HTTP/1.1 bytes in Dart, sends via `zigIoTcpWriteBytesFuture`
+- Keep-alive: Zig byte-scan for `Connection: close` header (no Dart string alloc)
+- `ZigHeaders`: case-insensitive map (lowercase storage)
+- ~2 io_uring round-trips per request (recv SQE + send SQE)
+
+**Benchmark (JIT, 1 worker, `wrk -t4 -c100 -d10s`):**
+```
+ZigHttpServer abstraction:  ~36.5k req/s  (~2 Dart awaits/request)
+Op.loop (zero-Dart path):   ~130k  req/s  (0 Dart awaits/request)
+dart:io AOT:                ~9.9k  req/s
+```
+ZigHttpServer provides full Dart request handlers at 3.7× dart:io throughput.
+Op.loop remains the fast path for static-response servers (12× dart:io).
+
+### async `ring.send` / `ring.recv` (io_uring, Linux)
+
+Replaced `posix.write()` fast-path with async `ring.send()` in `processLoopPipeline`:
+- All pending sends batched into one `io_uring_enter()` call
+- `ring.recv` / `ring.send` use socket-layer ops (bypass VFS)
+
+**Result (+12–15% throughput on 3-worker AOT):**
+```
+Before (posix.write):  ~178k req/s (3w AOT)
+After  (ring.send):    ~200-221k req/s
+```
+
+### SO_REUSEPORT multi-process for dart:io (`/tmp/reuseport_shim.so`)
+
+LD_PRELOAD shim that sets `SO_REUSEPORT` on every TCP socket, enabling N independent
+dart:io processes to share a port (the same model as Node.js cluster):
+
+```sh
+LD_PRELOAD=/tmp/reuseport_shim.so dartaotruntime server.aot 8080 &
+LD_PRELOAD=/tmp/reuseport_shim.so dartaotruntime server.aot 8080 &
+# kernel distributes connections evenly across both
+```
+
+**Benchmark (Linux VPS 6-core, `wrk -t4 -c100 -d15s`):**
+```
+dart:io AOT 1 process:                    ~9.9k req/s
+dart:io AOT 3 processes (shim):           ~31.3k req/s  (3.2× scaling)
+dart:io AOT 6 processes (shim):           ~46.8k req/s  (4.7× — diminishing returns)
+dart-zig AOT 1 worker:                    ~119.7k req/s
+dart-zig AOT 3 workers:                   ~225.2k req/s
+dart-zig AOT 6 workers:                   ~204.6k req/s
+```
+
+dart-zig 1 worker beats dart:io 6 processes by 2.5×. The fundamental gap is that
+dart:io does Dart work per request (header parsing, Future chains, response allocation);
+dart-zig Op.loop keeps the entire keep-alive cycle in Zig.
+
+### perf profile (AOT, 1 worker under wrk load)
+
+```
+96.23%  io_uring_enter (blocked in kernel waiting for I/O) ← expected, I/O bound
+ 1.01%  routeRequestFull (Zig HTTP parser)
+ 0.98%  processLoopPipeline (CQE handler + SQE submission)
+ 0.31%  io_uring_sqe.prep_rw / prep_recv
+ 0.20%  flush_sq
+```
+
+Key insight: server is I/O-bound. User-space CPU is negligible. Optimization headroom
+is in reducing kernel round-trips (SQPOLL) or network RTT, not Zig processing.
+
+---
+
 ## PERF-6 — Keep-alive loop native: zero Dart interactions per request (2026-04-15)
 
 **What changed:**

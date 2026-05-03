@@ -475,16 +475,19 @@ pub const EventLoop = struct {
                     const space = sd.recv_buf[sd.recv_len..];
                     if (space.len == 0) {
                         _ = posix.write(ctx.fd, http_responses.bad_request) catch {};
+                        posix.close(ctx.fd);
                         out.kind = .int_val;
                         out.int_val = -1;
                         return true;
                     }
                     const bytes_read = posix.read(ctx.fd, space) catch {
+                        posix.close(ctx.fd);
                         out.kind = .int_val;
                         out.int_val = -1;
                         return true;
                     };
                     if (bytes_read == 0) {
+                        posix.close(ctx.fd);
                         out.kind = .int_val;
                         out.int_val = -1;
                         return true;
@@ -493,6 +496,7 @@ pub const EventLoop = struct {
                 } else {
                     // Write phase: complete partial write remainder.
                     const n = posix.write(ctx.fd, sd.write_ptr[0..sd.write_len]) catch {
+                        posix.close(ctx.fd);
                         out.kind = .int_val;
                         out.int_val = -1;
                         return true;
@@ -501,6 +505,7 @@ pub const EventLoop = struct {
                         sd.write_ptr += n;
                         sd.write_len -= n;
                         if (!self.armServeWrite(idx, ctx.fd)) {
+                            posix.close(ctx.fd);
                             out.kind = .int_val;
                             out.int_val = -1;
                             return true;
@@ -509,6 +514,7 @@ pub const EventLoop = struct {
                     }
                     // Write complete.
                     if (sd.should_close) {
+                        posix.close(ctx.fd);
                         out.kind = .int_val;
                         out.int_val = -1;
                         return true;
@@ -523,6 +529,7 @@ pub const EventLoop = struct {
                 }
                 // Run pipelining loop.
                 if (self.processLoopPipeline(idx)) |val| {
+                    posix.close(ctx.fd);
                     out.kind = .int_val;
                     out.int_val = val;
                     return true;

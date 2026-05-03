@@ -22,11 +22,11 @@ pub const CompletionCtx = struct {
     port_id: engine.Dart_Port = 0,
     fd: posix.fd_t = -1,
     tls_id: u16 = 0,
-    data: Data = .{ .accept = {} },
+    data: Data = .{ .accept = .{} },
 
     pub const Data = union(Op) {
-        /// accept needs no extra data: we pass null addr/addrlen to accept().
-        accept: void,
+        /// accept: stores the listen fd so the CQE handler can immediately re-arm.
+        accept: struct { listen_fd: posix.fd_t = -1 },
         /// Pre-allocated receive buffer embedded in the slot.
         /// Filled by the kernel (io_uring) or posix.read (kqueue).
         /// Immediately reusable after postRecvResult posts a kTypedData copy.
