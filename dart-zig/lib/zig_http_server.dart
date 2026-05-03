@@ -83,19 +83,21 @@ class ZigHttpServer {
           if (parsed != null) {
             final bodyOffset = parsed.bodyOffset;
             final keepAlive = _keepAlive(recvBuf, bodyOffset);
+            final framed = _frameRequest(recvBuf, bufLen, bodyOffset);
+            if (framed == null) continue;
 
             final response = ZigHttpResponse(connFd);
             final request = ZigHttpRequest(
-                parsed.method, parsed.path, response);
+                parsed.method, parsed.path, framed.bodyBytes, response);
 
             _controller.add(request);
             await response._doneFuture;
 
             // Shift any pipelined data to buffer front.
-            final remaining = bufLen - bodyOffset;
+            final remaining = bufLen - framed.endOffset;
             if (remaining > 0) {
               recvBuf.setRange(0, remaining,
-                  Uint8List.sublistView(recvBuf, bodyOffset, bufLen));
+                  Uint8List.sublistView(recvBuf, framed.endOffset, bufLen));
             }
             bufLen = remaining;
 
@@ -119,14 +121,17 @@ class ZigHttpRequest {
   final String method;
   // Raw path string — use this for simple route matching (no allocation).
   final String path;
+  final Uint8List bodyBytes;
   final ZigHttpResponse response;
 
-  ZigHttpRequest(this.method, this.path, this.response);
+  ZigHttpRequest(this.method, this.path, this.bodyBytes, this.response);
 
   // Full Uri — lazy. Only materialised when query params or other Uri fields
   // are needed. Simple `switch (req.path)` routing never pays this cost.
   Uri? _uri;
   Uri get uri => _uri ??= Uri.parse(path);
+
+  String get bodyText => utf8.decode(bodyBytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,4 +266,148 @@ bool _keepAlive(Uint8List buf, int bodyOffset) {
     pos++;
   }
   return true; // HTTP/1.1 default: keep-alive
+}
+
+class _FramedRequest {
+  final int endOffset;
+  final Uint8List bodyBytes;
+
+  const _FramedRequest(this.endOffset, this.bodyBytes);
+}
+
+_FramedRequest? _frameRequest(Uint8List buf, int bufLen, int bodyOffset) {
+  final transferEncoding = _headerValue(buf, bodyOffset, 'transfer-encoding');
+  if (transferEncoding != null &&
+      transferEncoding.toLowerCase().contains('chunked')) {
+    return _decodeChunkedBody(buf, bufLen, bodyOffset);
+  }
+
+  final contentLengthValue = _headerValue(buf, bodyOffset, 'content-length');
+  if (contentLengthValue != null) {
+    final contentLength = int.tryParse(contentLengthValue.trim());
+    if (contentLength == null || contentLength < 0) return null;
+    final endOffset = bodyOffset + contentLength;
+    if (bufLen < endOffset) return null;
+    return _FramedRequest(
+      endOffset,
+      Uint8List.sublistView(buf, bodyOffset, endOffset),
+    );
+  }
+
+  return _FramedRequest(bodyOffset, Uint8List(0));
+}
+
+String? _headerValue(Uint8List buf, int bodyOffset, String name) {
+  final lowerName = ascii.encode(name.toLowerCase());
+  int pos = 0;
+  while (pos < bodyOffset && buf[pos] != 0x0a) pos++;
+  pos++;
+
+  while (pos < bodyOffset) {
+    if (buf[pos] == 0x0d || buf[pos] == 0x0a) break;
+
+    var colon = pos;
+    while (colon < bodyOffset && buf[colon] != 0x3a && buf[colon] != 0x0a) {
+      colon++;
+    }
+    if (colon >= bodyOffset || buf[colon] != 0x3a) break;
+
+    final nameLen = colon - pos;
+    if (nameLen == lowerName.length) {
+      var match = true;
+      for (var i = 0; i < lowerName.length; i++) {
+        if ((buf[pos + i] | 0x20) != lowerName[i]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        var valueStart = colon + 1;
+        while (valueStart < bodyOffset &&
+            (buf[valueStart] == 0x20 || buf[valueStart] == 0x09)) {
+          valueStart++;
+        }
+        var valueEnd = valueStart;
+        while (valueEnd < bodyOffset &&
+            buf[valueEnd] != 0x0d &&
+            buf[valueEnd] != 0x0a) {
+          valueEnd++;
+        }
+        return ascii.decode(buf.sublist(valueStart, valueEnd));
+      }
+    }
+
+    while (pos < bodyOffset && buf[pos] != 0x0a) pos++;
+    pos++;
+  }
+
+  return null;
+}
+
+_FramedRequest? _decodeChunkedBody(Uint8List buf, int bufLen, int bodyOffset) {
+  var pos = bodyOffset;
+  final body = BytesBuilder(copy: false);
+
+  while (true) {
+    final lineEnd = _findLineEnd(buf, pos, bufLen);
+    if (lineEnd == null) return null;
+    final sizeText = ascii
+        .decode(buf.sublist(pos, lineEnd))
+        .split(';')
+        .first
+        .trim();
+    final chunkSize = int.tryParse(sizeText, radix: 16);
+    if (chunkSize == null || chunkSize < 0) return null;
+    final nextPos = _advancePastLineEnd(buf, lineEnd, bufLen);
+    if (nextPos == null) return null;
+    pos = nextPos;
+
+    if (chunkSize == 0) {
+      while (true) {
+        final trailerEnd = _findLineEnd(buf, pos, bufLen);
+        if (trailerEnd == null) return null;
+        if (trailerEnd == pos) {
+          final endOffset = _advancePastLineEnd(buf, trailerEnd, bufLen);
+          if (endOffset == null) return null;
+          return _FramedRequest(endOffset, body.takeBytes());
+        }
+        final nextTrailerPos = _advancePastLineEnd(buf, trailerEnd, bufLen);
+        if (nextTrailerPos == null) return null;
+        pos = nextTrailerPos;
+      }
+    }
+
+    final chunkEnd = pos + chunkSize;
+    if (chunkEnd + 1 >= bufLen) return null;
+    body.add(Uint8List.sublistView(buf, pos, chunkEnd));
+    pos = chunkEnd;
+
+    if (buf[pos] == 0x0d) {
+      if (pos + 1 >= bufLen || buf[pos + 1] != 0x0a) return null;
+      pos += 2;
+    } else if (buf[pos] == 0x0a) {
+      pos += 1;
+    } else {
+      return null;
+    }
+  }
+}
+
+int? _findLineEnd(Uint8List buf, int start, int limit) {
+  for (var i = start; i < limit; i++) {
+    if (buf[i] == 0x0a) {
+      return i > start && buf[i - 1] == 0x0d ? i - 1 : i;
+    }
+  }
+  return null;
+}
+
+int? _advancePastLineEnd(Uint8List buf, int lineEnd, int limit) {
+  if (lineEnd >= limit) return null;
+  if (buf[lineEnd] == 0x0a) return lineEnd + 1;
+  if (lineEnd + 1 < limit && buf[lineEnd] == 0x0d && buf[lineEnd + 1] == 0x0a) {
+    return lineEnd + 2;
+  }
+  if (lineEnd + 1 < limit && buf[lineEnd + 1] == 0x0a) return lineEnd + 2;
+  return null;
 }

@@ -21,6 +21,11 @@ int _sumQuery(Uri uri) {
   return sum;
 }
 
+int _bodyValue(ZigHttpRequest req) {
+  if (req.bodyBytes.isEmpty) return 0;
+  return int.tryParse(req.bodyText.trim()) ?? 0;
+}
+
 Future<void> main(List<String> args) async {
   final port = args.isNotEmpty ? int.parse(args[0]) : 8080;
   final server = await ZigHttpServer.bind('0.0.0.0', port);
@@ -40,10 +45,11 @@ Future<void> main(List<String> args) async {
         default:
           final uri = req.uri;
           if (uri.path == '/baseline11') {
+            final total = _sumQuery(uri) + _bodyValue(req);
             req.response
               ..statusCode = 200
               ..headers.set('content-type', 'text/plain; charset=utf-8')
-              ..write(_sumQuery(uri))
+              ..write(total)
               ..close();
           } else {
             req.response
