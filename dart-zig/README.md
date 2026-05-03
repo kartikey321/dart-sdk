@@ -35,21 +35,22 @@ Important caveats:
 - The fused `http_server.dart` fast path is the best-performing path today.
 - The higher-level `zig_http_server.dart` layer is more ergonomic, but slower.
 - For current macOS backend risks and parity work, see
-  `docs/dart-zig/macos-gap-review.md`.
+  `docs/dart-zig/macos-gap-review.md` and
+  `docs/dart-zig/macos-parity.md`.
 - The benchmark numbers below are split into:
   - recent validated measurements on the current codebase
   - older milestone results kept for historical context
 
 ### Recently validated measurements
 
-These are the latest measurements that were rechecked during the current audit
-cycle.
+These were rerun on the current `dart-zig` branch on 2026-05-03.
 
 **Linux single-worker, `io_uring`, `wrk -t4 -c256 -d5s`:**
 ```
-Fused fast path (`lib/http_server.dart`, JIT):        ~105k req/s
-`ZigHttpServer` (`lib/zig_http_server.dart`, JIT):    ~20k req/s
-`ZigHttpServer` (`lib/zig_http_server.dart`, AOT):    ~34k req/s
+Fused fast path (`lib/http_server.dart`, JIT):        201,160.98 req/s
+Fused fast path (`lib/http_server.dart`, AOT):        127,576.82 req/s
+`ZigHttpServer` (`lib/zig_http_server.dart`, JIT):     15,855.77 req/s
+`ZigHttpServer` (`lib/zig_http_server.dart`, AOT):     33,049.69 req/s
 ```
 
 Interpretation:
@@ -59,6 +60,38 @@ Interpretation:
   still useful as the higher-level API surface.
 - These numbers were measured on a single server worker, so they are not
   multi-worker scaling claims.
+- The `ZigHttpServer` JIT run showed timeouts under this load shape, so its JIT
+  number should be treated as a current measurement, not a ceiling.
+
+**Linux pipelined HTTP/1.1, pinned 6-core host, `scripts/bench_pipeline.sh`:**
+```
+Client shape: 6 threads, 64 connections, pipeline depth 16, duration 10s
+
+dart-zig fused fast path (JIT)
+  1 worker: 102,857.99 req/s
+  3 workers: 109,398.62 req/s
+  6 workers: 106,589.13 req/s
+
+dart-zig fused fast path (AOT)
+  1 worker: 156,085.64 req/s
+  3 workers: 159,538.62 req/s
+  6 workers: 165,551.58 req/s
+
+dart:io multi-process baseline with SO_REUSEPORT shim (JIT)
+  1 process: 35,158.62 req/s
+  6 processes: 40,554.66 req/s
+```
+
+Pipeline interpretation:
+
+- The fused `dart-zig` fast path stays well ahead of the stock `dart:io`
+  baseline under HTTP/1.1 pipelining on this machine.
+- In this setup, fused AOT is the strongest pipeline mode.
+- The pinned 6-core pipeline run does not scale linearly with worker count,
+  which suggests the current client shape, pipeline depth, or core split is
+  becoming the limiter rather than pure server throughput.
+- Minor nonzero error counts appeared in a couple of runs near the benchmark
+  cutoff, so these are current validated numbers, not final peak claims.
 
 ### Historical milestone results
 
@@ -369,6 +402,7 @@ Read the benchmark tables carefully:
 - macOS numbers in this file are currently historical until rerun on the clean
   upstream-based branch
 - Linux is the only backend that has been recently revalidated during the audit
+- all recently validated numbers in this file are single-worker results
 
 ## Historical Benchmark History
 
@@ -411,4 +445,5 @@ Read the benchmark tables carefully:
 
 - `docs/dart-zig/benchmarking.md` — full setup, build, run, and recording guide
 - `docs/dart-zig/macos-gap-review.md` — current macOS backend parity and safety gaps
+- `docs/dart-zig/macos-parity.md` — target checklist for calling macOS backend parity-ready
 - `docs/dart-zig/timeline/CHANGELOG.md` — phase-by-phase development log
