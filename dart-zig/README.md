@@ -9,16 +9,71 @@ layers between the Dart VM and the kernel.
 
 ## Status
 
-PERF-6 — Keep-alive loop native (entire connection lifecycle in Zig, zero Dart interactions per request).
+Current state:
 
-**macOS ARM64 single-worker (kqueue, `wrk -t4 -c128 -d10s`):**
+- Runtime substrate exists for both Linux (`io_uring`) and macOS (`kqueue`).
+- The project is strongest today as a custom runtime plus TCP and HTTP server
+  platform.
+- Linux is the production-first backend.
+- macOS is implemented, but is not yet at Linux correctness parity.
+- This is not yet a full `dart:io` replacement.
+
+Current focus:
+
+- keep the Linux path stable and production-safe
+- close the remaining macOS backend gaps
+- evolve the runtime/TCP/HTTP server stack before expanding to broader
+  `dart:io` compatibility
+
+Latest major runtime milestone:
+
+- `PERF-6`: keep-alive loop native, with the entire connection lifecycle in Zig
+  and zero Dart interactions per request on the fused fast path
+
+Important caveats:
+
+- The fused `http_server.dart` fast path is the best-performing path today.
+- The higher-level `zig_http_server.dart` layer is more ergonomic, but slower.
+- For current macOS backend risks and parity work, see
+  `docs/dart-zig/macos-gap-review.md`.
+- The benchmark numbers below are split into:
+  - recent validated measurements on the current codebase
+  - older milestone results kept for historical context
+
+### Recently validated measurements
+
+These are the latest measurements that were rechecked during the current audit
+cycle.
+
+**Linux single-worker, `io_uring`, `wrk -t4 -c256 -d5s`:**
+```
+Fused fast path (`lib/http_server.dart`, JIT):        ~105k req/s
+`ZigHttpServer` (`lib/zig_http_server.dart`, JIT):    ~20k req/s
+`ZigHttpServer` (`lib/zig_http_server.dart`, AOT):    ~34k req/s
+```
+
+Interpretation:
+
+- The fused Zig-side loop remains the performance path.
+- The Dart-layer `ZigHttpServer` abstraction is significantly slower, but it is
+  still useful as the higher-level API surface.
+- These numbers were measured on a single server worker, so they are not
+  multi-worker scaling claims.
+
+### Historical milestone results
+
+These are older milestone measurements that are still useful for trend history,
+but should not be treated as current parity proof for the present branch
+without rerunning them.
+
+**macOS ARM64 single-worker (historical, kqueue, `wrk -t4 -c128 -d10s`):**
 ```
 PERF-6 (loop op):   ~243k req/s JIT  /  ~275k req/s AOT  (0 await/request, 0 heap allocs)
 PERF-4 (serve op):  ~178k req/s      (1 await/request, 0 heap allocs)
 Phase 14 baseline:  ~159k req/s      (3 awaits/request, batch dispatcher)
 ```
 
-**Linux VPS 6-core (io_uring, ReleaseFast, taskset CPU-pinned, `bench_vps.sh`):**
+**Linux VPS 6-core (historical, io_uring, ReleaseFast, taskset CPU-pinned, `bench_vps.sh`):**
 ```
                JIT       AOT     vs PERF-4 JIT
 1 worker:    ~102k      97k          +7%
@@ -54,6 +109,29 @@ Dart application code
 - **CompletionCtx pool**: 4096 slots × ~8 KB each (32 MB heap). Each in-flight accept/recv/send occupies one slot. O(1) free-list allocator (`SlotAllocator`).
 - **Inline write fast-path**: `submitSend` tries `posix.write()` inline before queuing a SQE/kevent. On loopback the TCP send buffer is never full — eliminates a full kernel round-trip per echo.
 - **AOT support**: `dart-zig-aot` binary links `dart_engine_aot_shared`. Pass `.dylib` (macOS) or `.so` (Linux) snapshot; runtime auto-detects by extension.
+
+## Current Scope
+
+What exists today:
+
+- custom Dart runtime embedding
+- Linux `io_uring` event loop
+- macOS `kqueue` event loop
+- TCP accept/read/write/close primitives
+- HTTP server fast path in Zig
+- higher-level Dart HTTP server abstraction
+- partial TLS groundwork
+
+What does not exist yet as production-complete surface:
+
+- full `dart:io` parity
+- `HttpClient` replacement
+- filesystem/process/DNS/UDP parity
+- production-parity macOS backend behavior
+
+If the goal is full `dart:io` replacement, that is a larger follow-on project.
+The current codebase should be understood first as a server runtime and native
+I/O platform for Dart.
 
 ---
 
@@ -282,7 +360,17 @@ dart-zig/
 
 ---
 
-## Benchmark History
+## Benchmark Notes
+
+Read the benchmark tables carefully:
+
+- recent validated measurements are the most trustworthy for current state
+- historical milestone numbers are useful for trend tracking
+- macOS numbers in this file are currently historical until rerun on the clean
+  upstream-based branch
+- Linux is the only backend that has been recently revalidated during the audit
+
+## Historical Benchmark History
 
 ### macOS ARM64, kqueue, `wrk -t4 -c128`
 
@@ -322,4 +410,5 @@ dart-zig/
 ## Docs
 
 - `docs/dart-zig/benchmarking.md` — full setup, build, run, and recording guide
+- `docs/dart-zig/macos-gap-review.md` — current macOS backend parity and safety gaps
 - `docs/dart-zig/timeline/CHANGELOG.md` — phase-by-phase development log
