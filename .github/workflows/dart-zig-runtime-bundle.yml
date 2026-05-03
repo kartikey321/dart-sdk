@@ -100,3 +100,15 @@ jobs:
             dart-zig/dist
           docker push "${IMAGE_NAME}:sha-${GITHUB_SHA}"
           docker push "${IMAGE_NAME}:latest"
+
+      - name: Build and push GHCR builder image
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/dart-zig-builder
+        run: |
+          docker build \
+            -f dart-zig/docker/Dockerfile.builder-base \
+            -t "${IMAGE_NAME}:sha-${GITHUB_SHA}" \
+            -t "${IMAGE_NAME}:latest" \
+            .
+          docker push "${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          docker push "${IMAGE_NAME}:latest"
