@@ -1043,7 +1043,7 @@ fn submitLoop(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
     }
 }
 
-fn submitSend(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t, buf: []u8) void {
+fn submitSend(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t, buf: []const u8) void {
     const self: *EventLoop = @ptrCast(@alignCast(loop));
     const ctx = &self.pool[slot_idx];
     const udata = @as(usize, state.kPoolBase) + slot_idx;

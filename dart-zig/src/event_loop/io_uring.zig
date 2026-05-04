@@ -452,9 +452,23 @@ pub const EventLoop = struct {
                 return false;
             },
             .send => {
-                // cqe.res is bytes sent (>=0) or -errno.
+                const sd = &ctx.data.send;
+                if (cqe.res <= 0) {
+                    out.kind = .int_val;
+                    out.int_val = -1;
+                    return true;
+                }
+                sd.sent += @intCast(cqe.res);
+                if (sd.sent < sd.len) {
+                    _ = self.ring.send(cqe.user_data, ctx.fd, sd.remaining(), linux.MSG.NOSIGNAL) catch {
+                        out.kind = .int_val;
+                        out.int_val = -1;
+                        return true;
+                    };
+                    return false;
+                }
                 out.kind = .int_val;
-                out.int_val = @as(i64, cqe.res);
+                out.int_val = @intCast(sd.len);
                 return true;
             },
             .tls_handshake => {
@@ -798,7 +812,22 @@ pub const EventLoop = struct {
                 }
             },
             .send => {
-                _ = engine.Dart_PostInteger(ctx.port_id, cqe.res);
+                const sd = &ctx.data.send;
+                if (cqe.res <= 0) {
+                    _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+                sd.sent += @intCast(cqe.res);
+                if (sd.sent < sd.len) {
+                    _ = self.ring.send(cqe.user_data, ctx.fd, sd.remaining(), linux.MSG.NOSIGNAL) catch {
+                        _ = engine.Dart_PostInteger(ctx.port_id, -1);
+                        state.freeSlot(self.pool, &self.slot_alloc, idx);
+                        return;
+                    };
+                    return;
+                }
+                _ = engine.Dart_PostInteger(ctx.port_id, @intCast(sd.len));
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
             },
             .tls_handshake => {
@@ -946,9 +975,10 @@ fn submitRecvRoute(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
     };
 }
 
-fn submitSend(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t, buf: []u8) void {
+fn submitSend(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t, buf: []const u8) void {
     const self: *EventLoop = @ptrCast(@alignCast(loop));
     const ctx = &self.pool[slot_idx];
+    const sd = &ctx.data.send;
     const user_data: u64 = state.kPoolBase + @as(u64, slot_idx);
 
     // Inline fast-path: try posix.write() before touching the ring.
@@ -966,14 +996,16 @@ fn submitSend(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t, buf: []u8) void
         return;
     };
     if (n > 0) {
-        // Full or partial write succeeded inline.
-        // Post result directly — no SQE needed, one fewer kernel round-trip.
-        self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, @intCast(n), 0);
-        state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
-        return;
+        sd.sent += n;
+        if (sd.sent == sd.len) {
+            // Entire payload sent inline — no SQE needed.
+            self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, @intCast(sd.len), 0);
+            state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
+            return;
+        }
     }
-    // n == 0 means EAGAIN: send buffer full. Fall through to async SQE.
-    _ = self.ring.write(user_data, fd, buf, 0) catch {
+    // n == 0 means EAGAIN; n > 0 but sd.sent < sd.len means short write.
+    _ = self.ring.send(user_data, fd, sd.remaining(), linux.MSG.NOSIGNAL) catch {
         self.postSingleCompletion(ctx.port_id, slot_idx, .int_val, -1, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     };

@@ -6,6 +6,23 @@ const profiler = @import("../../profiler.zig");
 const http_parser = @import("../../http/parser.zig");
 const http_responses = @import("../../http/responses.zig");
 
+fn initSendCtx(ctx: *state.CompletionCtx, src: []const u8) ![]u8 {
+    ctx.data = .{ .send = .{} };
+    ctx.data.send.len = src.len;
+    ctx.data.send.sent = 0;
+
+    if (src.len <= state.kBufSize) {
+        @memcpy(ctx.data.send.buf[0..src.len], src);
+        return ctx.data.send.buf[0..src.len];
+    }
+
+    const owned = try std.heap.c_allocator.alloc(u8, src.len);
+    @memcpy(owned, src);
+    ctx.data.send.owned_ptr = owned.ptr;
+    ctx.data.send.owned_len = owned.len;
+    return owned;
+}
+
 /// ZigIo_TcpBind(host: String, port: int, backlog: int) → int (fd or -errno)
 /// Synchronous: creates, binds, and listens a TCP socket. Returns fd on success.
 pub fn ZigIo_TcpBind(args: engine.Dart_NativeArguments) callconv(.c) void {
@@ -297,18 +314,24 @@ pub fn ZigIo_TcpWriteBytesToken(args: engine.Dart_NativeArguments) callconv(.c) 
         return;
     };
 
-    const send_len: usize = @min(@as(usize, @intCast(data_len)), state.kBufSize);
     const ctx = &loop.pool[idx];
     ctx.op = .send;
     ctx.port_id = token;
     ctx.fd = @intCast(fd_val);
     ctx.tls_id = 0;
-    ctx.data = .{ .send = .{ .len = send_len } };
-    @memcpy(ctx.data.send.buf[0..send_len], @as([*]u8, @ptrCast(data_ptr.?))[0..send_len]);
+    const send_buf = initSendCtx(
+        ctx,
+        @as([*]u8, @ptrCast(data_ptr.?))[0..@as(usize, @intCast(data_len))],
+    ) catch {
+        _ = engine.Dart_TypedDataReleaseData(list);
+        state.freeSlot(loop.pool, loop.slot_alloc, idx);
+        postTokenInt(loop, token, -1);
+        return;
+    };
     _ = engine.Dart_TypedDataReleaseData(list);
 
     if (profiler.enabled) profiler.p.onNativePost();
-    loop.ops.submit_send(loop.ptr, idx, @intCast(fd_val), ctx.data.send.buf[0..send_len]);
+    loop.ops.submit_send(loop.ptr, idx, @intCast(fd_val), send_buf);
 }
 
 /// ZigIo_TcpAccept(listenFd: int, sendPort: SendPort) → void
@@ -405,16 +428,30 @@ pub fn ZigIo_TcpWrite(args: engine.Dart_NativeArguments) callconv(.c) void {
         return;
     };
 
-    const send_len: usize = @min(@as(usize, @intCast(length)), state.kBufSize);
     const ctx = &loop.pool[idx];
     ctx.op = .send;
     ctx.port_id = port_id;
     ctx.fd = @intCast(fd_val);
     ctx.tls_id = 0;
-    ctx.data = .{ .send = .{ .len = send_len } };
+    ctx.data = .{ .send = .{} };
+    const send_len: usize = @intCast(length);
+    ctx.data.send.len = send_len;
+    ctx.data.send.sent = 0;
+    const send_buf = if (send_len <= state.kBufSize)
+        ctx.data.send.buf[0..send_len]
+    else blk: {
+        const owned = std.heap.c_allocator.alloc(u8, send_len) catch {
+            state.freeSlot(loop.pool, loop.slot_alloc, idx);
+            _ = engine.Dart_PostInteger(port_id, -1);
+            return;
+        };
+        ctx.data.send.owned_ptr = owned.ptr;
+        ctx.data.send.owned_len = owned.len;
+        break :blk owned;
+    };
 
-    // Copy byte-by-byte from Dart List<int> into embedded send buffer.
-    for (ctx.data.send.buf[0..send_len], 0..) |*byte, i| {
+    // Copy byte-by-byte from Dart List<int> into the send buffer.
+    for (send_buf, 0..) |*byte, i| {
         const elem = engine.Dart_ListGetAt(list, @intCast(i));
         var v: i64 = 0;
         _ = engine.Dart_IntegerToInt64(elem, &v);
@@ -422,7 +459,7 @@ pub fn ZigIo_TcpWrite(args: engine.Dart_NativeArguments) callconv(.c) void {
     }
 
     if (profiler.enabled) profiler.p.onNativePost();
-    loop.ops.submit_send(loop.ptr, idx, @intCast(fd_val), ctx.data.send.buf[0..send_len]);
+    loop.ops.submit_send(loop.ptr, idx, @intCast(fd_val), send_buf);
 }
 
 /// ZigIo_TcpWriteBytes(connFd: int, bytes: Uint8List, sendPort: SendPort) → void
@@ -465,19 +502,23 @@ pub fn ZigIo_TcpWriteBytes(args: engine.Dart_NativeArguments) callconv(.c) void 
         return;
     };
 
-    const send_len: usize = @min(@as(usize, @intCast(data_len)), state.kBufSize);
     const ctx = &loop.pool[idx];
     ctx.op = .send;
     ctx.port_id = port_id;
     ctx.fd = @intCast(fd_val);
     ctx.tls_id = 0;
-    ctx.data = .{ .send = .{ .len = send_len } };
-
-    // Single memcpy from Dart heap into embedded send buffer.
-    @memcpy(ctx.data.send.buf[0..send_len], @as([*]u8, @ptrCast(data_ptr.?))[0..send_len]);
+    const send_buf = initSendCtx(
+        ctx,
+        @as([*]u8, @ptrCast(data_ptr.?))[0..@as(usize, @intCast(data_len))],
+    ) catch {
+        _ = engine.Dart_TypedDataReleaseData(list);
+        state.freeSlot(loop.pool, loop.slot_alloc, idx);
+        _ = engine.Dart_PostInteger(port_id, -1);
+        return;
+    };
     _ = engine.Dart_TypedDataReleaseData(list);
 
-    loop.ops.submit_send(loop.ptr, idx, @intCast(fd_val), ctx.data.send.buf[0..send_len]);
+    loop.ops.submit_send(loop.ptr, idx, @intCast(fd_val), send_buf);
 }
 
 /// ZigIo_Close(fd: int) → void  (no-scope leaf)

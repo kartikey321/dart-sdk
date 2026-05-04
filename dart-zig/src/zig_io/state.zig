@@ -72,6 +72,18 @@ pub const CompletionCtx = struct {
     pub const SendData = struct {
         buf: [kBufSize]u8 = undefined,
         len: usize = 0,
+        sent: usize = 0,
+        owned_ptr: ?[*]u8 = null,
+        owned_len: usize = 0,
+
+        pub fn payload(self: *const SendData) []const u8 {
+            if (self.owned_ptr) |ptr| return ptr[0..self.owned_len];
+            return self.buf[0..self.len];
+        }
+
+        pub fn remaining(self: *const SendData) []const u8 {
+            return self.payload()[self.sent..self.len];
+        }
     };
 };
 
@@ -86,7 +98,7 @@ pub const LoopOps = struct {
     submit_serve: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
     /// Keep-alive connection loop — entire connection lifecycle in Zig; posts only on close.
     submit_loop: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
-    submit_send: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t, buf: []u8) void,
+    submit_send: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t, buf: []const u8) void,
 };
 
 pub const LoopRef = struct {
@@ -132,6 +144,16 @@ pub fn allocSlot(pool: *[kPoolSize]CompletionCtx, slots: *SlotAllocator) ?usize 
 pub fn freeSlot(pool: *[kPoolSize]CompletionCtx, slots: *SlotAllocator, idx: usize) void {
     std.debug.assert(pool[idx].in_use);
     std.debug.assert(slots.free_len < kPoolSize);
+    if (pool[idx].op == .send) {
+        const sd = &pool[idx].data.send;
+        if (sd.owned_ptr) |ptr| {
+            std.heap.c_allocator.free(ptr[0..sd.owned_len]);
+            sd.owned_ptr = null;
+            sd.owned_len = 0;
+        }
+        sd.len = 0;
+        sd.sent = 0;
+    }
     pool[idx].in_use = false;
     slots.free_stack[slots.free_len] = @intCast(idx);
     slots.free_len += 1;
