@@ -95,6 +95,8 @@ pub extern fn Dart_IntegerToInt64(integer: DartHandle, value: *i64) DartHandle;
 pub extern fn Dart_NewInteger(value: i64) DartHandle;
 pub extern fn Dart_Null() DartHandle;
 pub extern fn Dart_IsNull(handle: DartHandle) bool;
+pub extern fn Dart_True() DartHandle;
+pub extern fn Dart_False() DartHandle;
 
 // TypedData (Uint8List) helpers
 pub extern fn Dart_TypedDataAcquireData(

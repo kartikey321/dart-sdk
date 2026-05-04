@@ -12,6 +12,12 @@ import 'dart:typed_data';
 @pragma('vm:external-name', 'ZigHttp_Parse')
 external List<Object?>? _zigHttpParse(Uint8List bytes);
 
+/// Parse and frame one HTTP/1.1 request from raw bytes.
+/// Returns [method, path, bodyOffset, endOffset, keepAlive, chunked] on
+/// success, null if incomplete/invalid.
+@pragma('vm:external-name', 'ZigHttp_FrameRequest')
+external List<Object?>? _zigHttpFrameRequest(Uint8List bytes);
+
 /// Parse AND route in one Zig call — zero heap allocation.
 /// Returns a [RouteId] integer constant.
 @pragma('vm:external-name', 'ZigHttp_RouteRequest')
@@ -73,6 +79,40 @@ HttpRequest? parseHttpRequest(Uint8List bytes) {
     result[0]! as String,
     result[1]! as String,
     result[2]! as int,
+    bytes,
+  );
+}
+
+class FramedHttpRequest {
+  final String method;
+  final String path;
+  final int bodyOffset;
+  final int endOffset;
+  final bool keepAlive;
+  final bool chunked;
+  final Uint8List rawBytes;
+
+  const FramedHttpRequest(
+    this.method,
+    this.path,
+    this.bodyOffset,
+    this.endOffset,
+    this.keepAlive,
+    this.chunked,
+    this.rawBytes,
+  );
+}
+
+FramedHttpRequest? frameHttpRequest(Uint8List bytes) {
+  final result = _zigHttpFrameRequest(bytes);
+  if (result == null) return null;
+  return FramedHttpRequest(
+    result[0]! as String,
+    result[1]! as String,
+    result[2]! as int,
+    result[3]! as int,
+    result[4]! as bool,
+    result[5]! as bool,
     bytes,
   );
 }

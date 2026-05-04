@@ -21,6 +21,16 @@ pub const ParseResult = struct {
     header_count: usize = 0,
 };
 
+pub const FramedRequest = struct {
+    status: ParseStatus = .incomplete,
+    method: []const u8 = &.{},
+    path: []const u8 = &.{},
+    body_offset: usize = 0,
+    end_offset: usize = 0,
+    keep_alive: bool = true,
+    chunked: bool = false,
+};
+
 /// Parse an HTTP/1.1 request from `buf`.
 /// Returns immediately with status=incomplete if more data is needed.
 /// Returns status=invalid for malformed requests (missing SP in request-line, etc.).
@@ -191,6 +201,120 @@ pub fn routeRequestFull(buf: []const u8) RouteResult {
 /// Zero allocations — only stack memory used.
 pub fn routeRequest(buf: []const u8) i64 {
     return routeRequestFull(buf).route;
+}
+
+pub fn frameRequest(buf: []const u8) FramedRequest {
+    const parsed = parse(buf);
+    if (parsed.status != .complete) {
+        return .{ .status = parsed.status };
+    }
+
+    var keep_alive = true;
+    var chunked = false;
+    var content_length: ?usize = null;
+
+    var i: usize = 0;
+    while (i < parsed.header_count) : (i += 1) {
+        const header = parsed.headers[i];
+        if (std.ascii.eqlIgnoreCase(header.name, "connection")) {
+            if (std.ascii.eqlIgnoreCase(header.value, "close")) {
+                keep_alive = false;
+            }
+        } else if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
+            content_length = std.fmt.parseInt(usize, header.value, 10) catch {
+                return .{ .status = .invalid };
+            };
+        } else if (std.ascii.eqlIgnoreCase(header.name, "transfer-encoding")) {
+            if (std.ascii.indexOfIgnoreCase(header.value, "chunked") != null) {
+                chunked = true;
+            }
+        }
+    }
+
+    if (chunked) {
+        const end_offset = chunkedEndOffset(buf, parsed.body_offset) orelse {
+            return .{ .status = .incomplete };
+        };
+        return .{
+            .status = .complete,
+            .method = parsed.method,
+            .path = parsed.path,
+            .body_offset = parsed.body_offset,
+            .end_offset = end_offset,
+            .keep_alive = keep_alive,
+            .chunked = true,
+        };
+    }
+
+    const body_len = content_length orelse 0;
+    const end_offset = parsed.body_offset + body_len;
+    if (buf.len < end_offset) {
+        return .{ .status = .incomplete };
+    }
+    return .{
+        .status = .complete,
+        .method = parsed.method,
+        .path = parsed.path,
+        .body_offset = parsed.body_offset,
+        .end_offset = end_offset,
+        .keep_alive = keep_alive,
+        .chunked = false,
+    };
+}
+
+fn chunkedEndOffset(buf: []const u8, body_offset: usize) ?usize {
+    var pos = body_offset;
+    while (true) {
+        const line_end = findLineEnd(buf, pos) orelse return null;
+        const size_text = std.mem.trim(u8, buf[pos..line_end], " \t");
+        const semi = std.mem.indexOfScalar(u8, size_text, ';');
+        const chunk_size_text = if (semi) |idx| size_text[0..idx] else size_text;
+        const chunk_size = std.fmt.parseInt(usize, chunk_size_text, 16) catch return null;
+        pos = advancePastLineEnd(buf, line_end) orelse return null;
+
+        if (chunk_size == 0) {
+            while (true) {
+                const trailer_end = findLineEnd(buf, pos) orelse return null;
+                if (trailer_end == pos) {
+                    return advancePastLineEnd(buf, trailer_end);
+                }
+                pos = advancePastLineEnd(buf, trailer_end) orelse return null;
+            }
+        }
+
+        const chunk_end = pos + chunk_size;
+        if (chunk_end >= buf.len) return null;
+        pos = chunk_end;
+
+        if (buf[pos] == '\r') {
+            if (pos + 1 >= buf.len or buf[pos + 1] != '\n') return null;
+            pos += 2;
+        } else if (buf[pos] == '\n') {
+            pos += 1;
+        } else {
+            return null;
+        }
+    }
+}
+
+fn findLineEnd(buf: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i < buf.len) : (i += 1) {
+        if (buf[i] == '\n') {
+            return if (i > start and buf[i - 1] == '\r') i - 1 else i;
+        }
+    }
+    return null;
+}
+
+fn advancePastLineEnd(buf: []const u8, line_end: usize) ?usize {
+    if (line_end >= buf.len) return null;
+    if (buf[line_end] == '\n') return line_end + 1;
+    if (line_end + 1 < buf.len and buf[line_end] == '\r' and buf[line_end + 1] == '\n') {
+        return line_end + 2;
+    }
+    if (line_end + 1 < buf.len and buf[line_end + 1] == '\n') return line_end + 2;
+    return null;
 }
 
 // ---------------------------------------------------------------------------

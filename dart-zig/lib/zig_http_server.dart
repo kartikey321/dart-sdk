@@ -20,7 +20,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'zig_io.dart';
-import 'zig_http.dart' show parseHttpRequest;
+import 'zig_http.dart' show frameHttpRequest;
 
 // ---------------------------------------------------------------------------
 // ZigHttpServer
@@ -77,18 +77,21 @@ class ZigHttpServer {
           recvBuf.setRange(bufLen, bufLen + chunk.length, chunk);
           bufLen += chunk.length;
 
-          // ZigHttp_Parse: fast Zig path, returns method/path/bodyOffset.
-          final parsed = parseHttpRequest(
+          // ZigHttp_FrameRequest: Zig decides completeness, keep-alive, and
+          // request end offset so Dart no longer rescans headers on the hot path.
+          final framed = frameHttpRequest(
               Uint8List.sublistView(recvBuf, 0, bufLen));
-          if (parsed != null) {
-            final bodyOffset = parsed.bodyOffset;
-            final keepAlive = _keepAlive(recvBuf, bodyOffset);
-            final framed = _frameRequest(recvBuf, bufLen, bodyOffset);
-            if (framed == null) continue;
+          if (framed != null) {
+            final bodyBytes = framed.chunked
+                ? (_decodeChunkedBody(
+                        recvBuf, framed.bodyOffset, framed.endOffset) ??
+                    Uint8List(0))
+                : Uint8List.sublistView(
+                    recvBuf, framed.bodyOffset, framed.endOffset);
 
             final response = ZigHttpResponse(connFd);
             final request = ZigHttpRequest(
-                parsed.method, parsed.path, framed.bodyBytes, response);
+                framed.method, framed.path, bodyBytes, response);
 
             _controller.add(request);
             await response._doneFuture;
@@ -101,7 +104,7 @@ class ZigHttpServer {
             }
             bufLen = remaining;
 
-            if (!keepAlive) return;
+            if (!framed.keepAlive) return;
             break;
           }
           // incomplete — keep reading
@@ -223,133 +226,12 @@ class ZigHeaders {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Check if Connection header requests close (default: keep-alive in HTTP/1.1).
-bool _keepAlive(Uint8List buf, int bodyOffset) {
-  // Scan for "connection:" header between request-line and body.
-  // Skip request line first.
-  int pos = 0;
-  while (pos < bodyOffset && buf[pos] != 0x0a) pos++;
-  pos++;
-
-  while (pos < bodyOffset) {
-    if (buf[pos] == 0x0d || buf[pos] == 0x0a) break;
-    // Match "connection:" case-insensitively (6 chars + ':').
-    if (pos + 11 < bodyOffset) {
-      final b = buf;
-      if ((b[pos] | 0x20) == 0x63 && // c
-          (b[pos + 1] | 0x20) == 0x6f && // o
-          (b[pos + 2] | 0x20) == 0x6e && // n
-          (b[pos + 3] | 0x20) == 0x6e && // n
-          (b[pos + 4] | 0x20) == 0x65 && // e
-          (b[pos + 5] | 0x20) == 0x63 && // c
-          (b[pos + 6] | 0x20) == 0x74 && // t
-          (b[pos + 7] | 0x20) == 0x69 && // i
-          (b[pos + 8] | 0x20) == 0x6f && // o
-          (b[pos + 9] | 0x20) == 0x6e && // n
-          b[pos + 10] == 0x3a) { // :
-        // Found Connection: — check if value contains "close".
-        var vp = pos + 11;
-        while (vp < bodyOffset && buf[vp] == 0x20) vp++;
-        if (vp + 5 <= bodyOffset &&
-            (buf[vp] | 0x20) == 0x63 &&
-            (buf[vp + 1] | 0x20) == 0x6c &&
-            (buf[vp + 2] | 0x20) == 0x6f &&
-            (buf[vp + 3] | 0x20) == 0x73 &&
-            (buf[vp + 4] | 0x20) == 0x65) {
-          return false; // Connection: close
-        }
-        return true; // Connection: keep-alive (or other value)
-      }
-    }
-    // Skip to next header line.
-    while (pos < bodyOffset && buf[pos] != 0x0a) pos++;
-    pos++;
-  }
-  return true; // HTTP/1.1 default: keep-alive
-}
-
-class _FramedRequest {
-  final int endOffset;
-  final Uint8List bodyBytes;
-
-  const _FramedRequest(this.endOffset, this.bodyBytes);
-}
-
-_FramedRequest? _frameRequest(Uint8List buf, int bufLen, int bodyOffset) {
-  final transferEncoding = _headerValue(buf, bodyOffset, 'transfer-encoding');
-  if (transferEncoding != null &&
-      transferEncoding.toLowerCase().contains('chunked')) {
-    return _decodeChunkedBody(buf, bufLen, bodyOffset);
-  }
-
-  final contentLengthValue = _headerValue(buf, bodyOffset, 'content-length');
-  if (contentLengthValue != null) {
-    final contentLength = int.tryParse(contentLengthValue.trim());
-    if (contentLength == null || contentLength < 0) return null;
-    final endOffset = bodyOffset + contentLength;
-    if (bufLen < endOffset) return null;
-    return _FramedRequest(
-      endOffset,
-      Uint8List.sublistView(buf, bodyOffset, endOffset),
-    );
-  }
-
-  return _FramedRequest(bodyOffset, Uint8List(0));
-}
-
-String? _headerValue(Uint8List buf, int bodyOffset, String name) {
-  final lowerName = ascii.encode(name.toLowerCase());
-  int pos = 0;
-  while (pos < bodyOffset && buf[pos] != 0x0a) pos++;
-  pos++;
-
-  while (pos < bodyOffset) {
-    if (buf[pos] == 0x0d || buf[pos] == 0x0a) break;
-
-    var colon = pos;
-    while (colon < bodyOffset && buf[colon] != 0x3a && buf[colon] != 0x0a) {
-      colon++;
-    }
-    if (colon >= bodyOffset || buf[colon] != 0x3a) break;
-
-    final nameLen = colon - pos;
-    if (nameLen == lowerName.length) {
-      var match = true;
-      for (var i = 0; i < lowerName.length; i++) {
-        if ((buf[pos + i] | 0x20) != lowerName[i]) {
-          match = false;
-          break;
-        }
-      }
-      if (match) {
-        var valueStart = colon + 1;
-        while (valueStart < bodyOffset &&
-            (buf[valueStart] == 0x20 || buf[valueStart] == 0x09)) {
-          valueStart++;
-        }
-        var valueEnd = valueStart;
-        while (valueEnd < bodyOffset &&
-            buf[valueEnd] != 0x0d &&
-            buf[valueEnd] != 0x0a) {
-          valueEnd++;
-        }
-        return ascii.decode(buf.sublist(valueStart, valueEnd));
-      }
-    }
-
-    while (pos < bodyOffset && buf[pos] != 0x0a) pos++;
-    pos++;
-  }
-
-  return null;
-}
-
-_FramedRequest? _decodeChunkedBody(Uint8List buf, int bufLen, int bodyOffset) {
+Uint8List? _decodeChunkedBody(Uint8List buf, int bodyOffset, int endOffset) {
   var pos = bodyOffset;
   final body = BytesBuilder(copy: false);
 
   while (true) {
-    final lineEnd = _findLineEnd(buf, pos, bufLen);
+    final lineEnd = _findLineEnd(buf, pos, endOffset);
     if (lineEnd == null) return null;
     final sizeText = ascii
         .decode(buf.sublist(pos, lineEnd))
@@ -358,32 +240,30 @@ _FramedRequest? _decodeChunkedBody(Uint8List buf, int bufLen, int bodyOffset) {
         .trim();
     final chunkSize = int.tryParse(sizeText, radix: 16);
     if (chunkSize == null || chunkSize < 0) return null;
-    final nextPos = _advancePastLineEnd(buf, lineEnd, bufLen);
+    final nextPos = _advancePastLineEnd(buf, lineEnd, endOffset);
     if (nextPos == null) return null;
     pos = nextPos;
 
     if (chunkSize == 0) {
       while (true) {
-        final trailerEnd = _findLineEnd(buf, pos, bufLen);
+        final trailerEnd = _findLineEnd(buf, pos, endOffset);
         if (trailerEnd == null) return null;
         if (trailerEnd == pos) {
-          final endOffset = _advancePastLineEnd(buf, trailerEnd, bufLen);
-          if (endOffset == null) return null;
-          return _FramedRequest(endOffset, body.takeBytes());
+          return body.takeBytes();
         }
-        final nextTrailerPos = _advancePastLineEnd(buf, trailerEnd, bufLen);
+        final nextTrailerPos = _advancePastLineEnd(buf, trailerEnd, endOffset);
         if (nextTrailerPos == null) return null;
         pos = nextTrailerPos;
       }
     }
 
     final chunkEnd = pos + chunkSize;
-    if (chunkEnd + 1 >= bufLen) return null;
+    if (chunkEnd + 1 >= endOffset) return null;
     body.add(Uint8List.sublistView(buf, pos, chunkEnd));
     pos = chunkEnd;
 
     if (buf[pos] == 0x0d) {
-      if (pos + 1 >= bufLen || buf[pos + 1] != 0x0a) return null;
+      if (pos + 1 >= endOffset || buf[pos + 1] != 0x0a) return null;
       pos += 2;
     } else if (buf[pos] == 0x0a) {
       pos += 1;

@@ -10,5 +10,6 @@ pub const NativeEntry = struct {
 
 pub const table: []const NativeEntry = &.{
     .{ .name = "ZigHttp_Parse",        .argc = 1, .func = http_natives.ZigHttp_Parse,        .auto_scope = true },
+    .{ .name = "ZigHttp_FrameRequest", .argc = 1, .func = http_natives.ZigHttp_FrameRequest, .auto_scope = true },
     .{ .name = "ZigHttp_RouteRequest", .argc = 1, .func = http_natives.ZigHttp_RouteRequest, .auto_scope = true },
 };
