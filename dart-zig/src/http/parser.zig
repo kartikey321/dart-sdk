@@ -262,6 +262,51 @@ pub fn frameRequest(buf: []const u8) FramedRequest {
     };
 }
 
+/// Decode a chunked request body in place.
+/// Writes decoded bytes starting at `body_offset` and returns the decoded body
+/// length. `end_offset` must point just past the terminating empty trailer line.
+pub fn decodeChunkedBodyInPlace(buf: []u8, body_offset: usize, end_offset: usize) ?usize {
+    var read_pos = body_offset;
+    var write_pos = body_offset;
+    const window = buf[0..end_offset];
+
+    while (true) {
+        const line_end = findLineEnd(window, read_pos) orelse return null;
+        const size_text = std.mem.trim(u8, window[read_pos..line_end], " \t");
+        const semi = std.mem.indexOfScalar(u8, size_text, ';');
+        const chunk_size_text = if (semi) |idx| size_text[0..idx] else size_text;
+        const chunk_size = std.fmt.parseInt(usize, chunk_size_text, 16) catch return null;
+        read_pos = advancePastLineEnd(window, line_end) orelse return null;
+
+        if (chunk_size == 0) {
+            while (true) {
+                const trailer_end = findLineEnd(window, read_pos) orelse return null;
+                if (trailer_end == read_pos) {
+                    _ = advancePastLineEnd(window, trailer_end) orelse return null;
+                    return write_pos - body_offset;
+                }
+                read_pos = advancePastLineEnd(window, trailer_end) orelse return null;
+            }
+        }
+
+        const chunk_end = read_pos + chunk_size;
+        if (chunk_end > end_offset) return null;
+        std.mem.copyForwards(u8, buf[write_pos .. write_pos + chunk_size], buf[read_pos..chunk_end]);
+        write_pos += chunk_size;
+        read_pos = chunk_end;
+
+        if (read_pos >= end_offset) return null;
+        if (buf[read_pos] == '\r') {
+            if (read_pos + 1 >= end_offset or buf[read_pos + 1] != '\n') return null;
+            read_pos += 2;
+        } else if (buf[read_pos] == '\n') {
+            read_pos += 1;
+        } else {
+            return null;
+        }
+    }
+}
+
 fn chunkedEndOffset(buf: []const u8, body_offset: usize) ?usize {
     var pos = body_offset;
     while (true) {

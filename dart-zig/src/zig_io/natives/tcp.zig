@@ -187,6 +187,35 @@ pub fn ZigIo_TcpReadToken(args: engine.Dart_NativeArguments) callconv(.c) void {
     loop.ops.submit_recv(loop.ptr, idx, @intCast(fd_val));
 }
 
+/// ZigIo_TcpReadRequestToken(connFd: int, token: int) → void
+/// Read and frame one full HTTP request in Zig, preserving pipelined leftovers
+/// in native connection state across submissions.
+pub fn ZigIo_TcpReadRequestToken(args: engine.Dart_NativeArguments) callconv(.c) void {
+    if (profiler.enabled) profiler.p.onNativeEntry(.read);
+    var fd_val: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 0, &fd_val);
+    var token: i64 = 0;
+    _ = engine.Dart_GetNativeIntegerArgument(args, 1, &token);
+
+    const loop = state.current_loop orelse return;
+    const conn = state.request_conn_table.getOrCreate(@intCast(fd_val)) catch {
+        postTokenNull(loop, token);
+        return;
+    };
+    const idx = state.allocSlot(loop.pool, loop.slot_alloc) orelse {
+        postTokenNull(loop, token);
+        return;
+    };
+    const ctx = &loop.pool[idx];
+    ctx.op = .recv_request;
+    ctx.port_id = token;
+    ctx.fd = @intCast(fd_val);
+    ctx.tls_id = 0;
+    ctx.data = .{ .recv_request = .{ .conn = conn } };
+    if (profiler.enabled) profiler.p.onNativePost();
+    loop.ops.submit_recv_request(loop.ptr, idx, @intCast(fd_val));
+}
+
 /// ZigIo_TcpServeToken(connFd: int, token: int) → void
 /// Fused read+route+write in one async op. Posts 0 (keep-alive) or -1 (close) to Dart.
 /// One await per request instead of two — eliminates one Dart isolate crossing + Completer resume.
@@ -525,5 +554,6 @@ pub fn ZigIo_TcpWriteBytes(args: engine.Dart_NativeArguments) callconv(.c) void 
 pub fn ZigIo_Close(args: engine.Dart_NativeArguments) callconv(.c) void {
     var fd_val: i64 = 0;
     _ = engine.Dart_GetNativeIntegerArgument(args, 0, &fd_val);
+    state.request_conn_table.remove(@intCast(fd_val));
     posix.close(@intCast(fd_val));
 }

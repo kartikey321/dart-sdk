@@ -20,7 +20,6 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'zig_io.dart';
-import 'zig_http.dart' show frameHttpRequest;
 
 // ---------------------------------------------------------------------------
 // ZigHttpServer
@@ -62,53 +61,19 @@ class ZigHttpServer {
   }
 
   void _handleConnection(int connFd) async {
-    // Reuse a single 8 KB buffer per connection — no per-request allocation.
-    final recvBuf = Uint8List(8192);
-    int bufLen = 0;
-
     try {
       while (true) {
-        // Accumulate until we have a complete HTTP request.
-        while (true) {
-          final space = 8192 - bufLen;
-          if (space == 0) return; // request headers too large
-          final chunk = await zigIoTcpReadFuture(connFd, space);
-          if (chunk == null) return; // EOF or error
-          recvBuf.setRange(bufLen, bufLen + chunk.length, chunk);
-          bufLen += chunk.length;
+        final framed = await zigIoTcpReadRequestFuture(connFd);
+        if (framed == null) return;
 
-          // ZigHttp_FrameRequest: Zig decides completeness, keep-alive, and
-          // request end offset so Dart no longer rescans headers on the hot path.
-          final framed = frameHttpRequest(
-              Uint8List.sublistView(recvBuf, 0, bufLen));
-          if (framed != null) {
-            final bodyBytes = framed.chunked
-                ? (_decodeChunkedBody(
-                        recvBuf, framed.bodyOffset, framed.endOffset) ??
-                    Uint8List(0))
-                : Uint8List.sublistView(
-                    recvBuf, framed.bodyOffset, framed.endOffset);
+        final response = ZigHttpResponse(connFd);
+        final request =
+            ZigHttpRequest(framed.method, framed.path, framed.bodyBytes, response);
 
-            final response = ZigHttpResponse(connFd);
-            final request = ZigHttpRequest(
-                framed.method, framed.path, bodyBytes, response);
+        _controller.add(request);
+        await response._doneFuture;
 
-            _controller.add(request);
-            await response._doneFuture;
-
-            // Shift any pipelined data to buffer front.
-            final remaining = bufLen - framed.endOffset;
-            if (remaining > 0) {
-              recvBuf.setRange(0, remaining,
-                  Uint8List.sublistView(recvBuf, framed.endOffset, bufLen));
-            }
-            bufLen = remaining;
-
-            if (!framed.keepAlive) return;
-            break;
-          }
-          // incomplete — keep reading
-        }
+        if (!framed.keepAlive) return;
       }
     } finally {
       zigIoClose(connFd);
@@ -220,74 +185,4 @@ class ZigHeaders {
   void _setIfAbsent(String lowerName, String value) =>
       _map.putIfAbsent(lowerName, () => value);
   void _forEach(void Function(String, String) fn) => _map.forEach(fn);
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-Uint8List? _decodeChunkedBody(Uint8List buf, int bodyOffset, int endOffset) {
-  var pos = bodyOffset;
-  final body = BytesBuilder(copy: false);
-
-  while (true) {
-    final lineEnd = _findLineEnd(buf, pos, endOffset);
-    if (lineEnd == null) return null;
-    final sizeText = ascii
-        .decode(buf.sublist(pos, lineEnd))
-        .split(';')
-        .first
-        .trim();
-    final chunkSize = int.tryParse(sizeText, radix: 16);
-    if (chunkSize == null || chunkSize < 0) return null;
-    final nextPos = _advancePastLineEnd(buf, lineEnd, endOffset);
-    if (nextPos == null) return null;
-    pos = nextPos;
-
-    if (chunkSize == 0) {
-      while (true) {
-        final trailerEnd = _findLineEnd(buf, pos, endOffset);
-        if (trailerEnd == null) return null;
-        if (trailerEnd == pos) {
-          return body.takeBytes();
-        }
-        final nextTrailerPos = _advancePastLineEnd(buf, trailerEnd, endOffset);
-        if (nextTrailerPos == null) return null;
-        pos = nextTrailerPos;
-      }
-    }
-
-    final chunkEnd = pos + chunkSize;
-    if (chunkEnd + 1 >= endOffset) return null;
-    body.add(Uint8List.sublistView(buf, pos, chunkEnd));
-    pos = chunkEnd;
-
-    if (buf[pos] == 0x0d) {
-      if (pos + 1 >= endOffset || buf[pos + 1] != 0x0a) return null;
-      pos += 2;
-    } else if (buf[pos] == 0x0a) {
-      pos += 1;
-    } else {
-      return null;
-    }
-  }
-}
-
-int? _findLineEnd(Uint8List buf, int start, int limit) {
-  for (var i = start; i < limit; i++) {
-    if (buf[i] == 0x0a) {
-      return i > start && buf[i - 1] == 0x0d ? i - 1 : i;
-    }
-  }
-  return null;
-}
-
-int? _advancePastLineEnd(Uint8List buf, int lineEnd, int limit) {
-  if (lineEnd >= limit) return null;
-  if (buf[lineEnd] == 0x0a) return lineEnd + 1;
-  if (lineEnd + 1 < limit && buf[lineEnd] == 0x0d && buf[lineEnd + 1] == 0x0a) {
-    return lineEnd + 2;
-  }
-  if (lineEnd + 1 < limit && buf[lineEnd + 1] == 0x0a) return lineEnd + 2;
-  return null;
 }

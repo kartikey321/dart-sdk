@@ -120,7 +120,9 @@ pub extern fn Dart_PostInteger(port_id: Dart_Port, value: i64) bool;
 // as_external_typed_data (40 bytes on 64-bit); _pad ensures correct sizing.
 pub const Dart_CObject_Type = c_int;
 pub const Dart_CObject_kNull: Dart_CObject_Type = 0;
+pub const Dart_CObject_kBool: Dart_CObject_Type = 1;
 pub const Dart_CObject_kInt64: Dart_CObject_Type = 3;
+pub const Dart_CObject_kString: Dart_CObject_Type = 5;
 pub const Dart_CObject_kArray: Dart_CObject_Type = 6;
 pub const Dart_CObject_kTypedData: Dart_CObject_Type = 7;
 pub const Dart_CObject_kExternalTypedData: Dart_CObject_Type = 8;
@@ -135,7 +137,9 @@ pub const Dart_HandleFinalizer = ?*const fn (
 pub const Dart_CObject = extern struct {
     @"type": Dart_CObject_Type,
     value: extern union {
+        as_bool: bool,
         as_int64: i64,
+        as_string: [*:0]const u8,
         // kArray: flat list of Dart_CObject pointers.
         // Used by completion batching (Phase 14) to deliver N results in one message.
         as_array: extern struct {

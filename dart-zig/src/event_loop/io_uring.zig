@@ -89,6 +89,7 @@ pub const EventLoop = struct {
     }
 
     pub fn deinit(self: *EventLoop) void {
+        state.request_conn_table.deinit();
         posix.close(self.signal_fd);
         posix.close(self.notify_fd);
         self.ring.deinit();
@@ -260,7 +261,7 @@ pub const EventLoop = struct {
     // Batch types — mirror of kqueue.zig BatchKind / BatchEntry.
     // -------------------------------------------------------------------------
 
-    const BatchKind = enum { int_val, null_val, typed_data };
+    const BatchKind = enum { int_val, null_val, typed_data, request_val };
 
     const BatchEntry = struct {
         token: engine.Dart_Port,
@@ -269,6 +270,107 @@ pub const EventLoop = struct {
         int_val: i64 = 0,
         bytes_len: usize = 0,
     };
+
+    fn shiftRecvRequestAfterPost(self: *EventLoop, idx: usize) void {
+        const rd = &self.pool[idx].data.recv_request;
+        const conn = rd.conn orelse return;
+        const remaining = conn.recv_len - rd.end_off;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, conn.recv_buf[0..remaining], conn.recv_buf[rd.end_off..conn.recv_len]);
+        }
+        conn.recv_len = remaining;
+    }
+
+    fn fillReadRequestMetadata(self: *EventLoop, idx: usize) bool {
+        const rd = &self.pool[idx].data.recv_request;
+        const conn = rd.conn orelse return false;
+        const framed = http_parser.frameRequest(conn.recv_buf[0..conn.recv_len]);
+        if (framed.status == .incomplete) return false;
+        if (framed.status != .complete) return false;
+
+        const base_ptr = @intFromPtr(&conn.recv_buf);
+        rd.method_off = @intFromPtr(framed.method.ptr) - base_ptr;
+        rd.method_len = framed.method.len;
+        rd.path_off = @intFromPtr(framed.path.ptr) - base_ptr;
+        rd.path_len = framed.path.len;
+        rd.body_off = framed.body_offset;
+        rd.end_off = framed.end_offset;
+        rd.keep_alive = framed.keep_alive;
+        rd.chunked = framed.chunked;
+        if (framed.chunked) {
+            const decoded_len = http_parser.decodeChunkedBodyInPlace(&conn.recv_buf, framed.body_offset, framed.end_offset) orelse return false;
+            rd.body_len = decoded_len;
+        } else {
+            rd.body_len = framed.end_offset - framed.body_offset;
+        }
+        return true;
+    }
+
+    fn postSingleRequestCompletion(self: *EventLoop, token: engine.Dart_Port, slot_idx: usize) void {
+        const rd = &self.pool[slot_idx].data.recv_request;
+        const conn = rd.conn orelse return;
+
+        var method_buf: [17]u8 = [_]u8{0} ** 17;
+        const method_len = @min(rd.method_len, method_buf.len - 1);
+        @memcpy(method_buf[0..method_len], conn.recv_buf[rd.method_off .. rd.method_off + method_len]);
+
+        var path_buf: [4097]u8 = [_]u8{0} ** 4097;
+        const path_len = @min(rd.path_len, path_buf.len - 1);
+        @memcpy(path_buf[0..path_len], conn.recv_buf[rd.path_off .. rd.path_off + path_len]);
+
+        var body_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kTypedData,
+            .value = .{ .as_typed_data = .{
+                .data_type = engine.Dart_TypedData_kUint8,
+                .length = @intCast(rd.body_len),
+                .values = conn.recv_buf[rd.body_off .. rd.body_off + rd.body_len].ptr,
+            } },
+        };
+        var method_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kString,
+            .value = .{ .as_string = method_buf[0..method_len :0].ptr },
+        };
+        var path_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kString,
+            .value = .{ .as_string = path_buf[0..path_len :0].ptr },
+        };
+        var keep_alive_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kBool,
+            .value = .{ .as_bool = rd.keep_alive },
+        };
+        var chunked_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kBool,
+            .value = .{ .as_bool = rd.chunked },
+        };
+        var request_values = [5]?*engine.Dart_CObject{
+            &method_obj,
+            &path_obj,
+            &body_obj,
+            &keep_alive_obj,
+            &chunked_obj,
+        };
+        var request_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kArray,
+            .value = .{ .as_array = .{
+                .length = 5,
+                .values = request_values[0..].ptr,
+            } },
+        };
+        var token_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kInt64,
+            .value = .{ .as_int64 = token },
+        };
+        var pair_values = [2]?*engine.Dart_CObject{ &token_obj, &request_obj };
+        var pair_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kArray,
+            .value = .{ .as_array = .{
+                .length = 2,
+                .values = pair_values[0..].ptr,
+            } },
+        };
+        _ = engine.Dart_PostCObject(self.batch_port_id, &pair_obj);
+        self.shiftRecvRequestAfterPost(slot_idx);
+    }
 
     // -------------------------------------------------------------------------
     // collectPoolCqe — extract result from a pool CQE into a BatchEntry.
@@ -302,6 +404,41 @@ pub const EventLoop = struct {
                     out.kind = .null_val;
                 }
                 return true;
+            },
+            .recv_request => {
+                const rd = &ctx.data.recv_request;
+                const conn = rd.conn orelse {
+                    out.kind = .null_val;
+                    return true;
+                };
+                if (cqe.res <= 0) {
+                    state.request_conn_table.remove(ctx.fd);
+                    out.kind = .null_val;
+                    return true;
+                }
+                conn.recv_len += @intCast(cqe.res);
+                if (self.fillReadRequestMetadata(idx)) {
+                    out.kind = .request_val;
+                    return true;
+                }
+                const framed = http_parser.frameRequest(conn.recv_buf[0..conn.recv_len]);
+                if (framed.status == .invalid) {
+                    state.request_conn_table.remove(ctx.fd);
+                    out.kind = .null_val;
+                    return true;
+                }
+                const space = conn.recv_buf[conn.recv_len..];
+                if (space.len == 0) {
+                    state.request_conn_table.remove(ctx.fd);
+                    out.kind = .null_val;
+                    return true;
+                }
+                _ = self.ring.recv(cqe.user_data, ctx.fd, .{ .buffer = space }, 0) catch {
+                    state.request_conn_table.remove(ctx.fd);
+                    out.kind = .null_val;
+                    return true;
+                };
+                return false;
             },
             .recv_route => {
                 // Read completed — parse+route in Zig, post a route int to Dart.
@@ -528,6 +665,15 @@ pub const EventLoop = struct {
         var token_objs: [32]engine.Dart_CObject = undefined;
         var value_objs: [32]engine.Dart_CObject = undefined;
         var ptrs: [64]?*engine.Dart_CObject = undefined;
+        var request_objs: [32]engine.Dart_CObject = undefined;
+        var method_objs: [32]engine.Dart_CObject = undefined;
+        var path_objs: [32]engine.Dart_CObject = undefined;
+        var body_objs: [32]engine.Dart_CObject = undefined;
+        var keep_alive_objs: [32]engine.Dart_CObject = undefined;
+        var chunked_objs: [32]engine.Dart_CObject = undefined;
+        var request_values: [32][5]?*engine.Dart_CObject = undefined;
+        var method_bufs: [32][17]u8 = undefined;
+        var path_bufs: [32][4097]u8 = undefined;
 
         for (batch, 0..) |entry, i| {
             token_objs[i] = .{
@@ -551,6 +697,60 @@ pub const EventLoop = struct {
                         .values = self.pool[entry.slot_idx].data.recv.buf[0..entry.bytes_len].ptr,
                     } },
                 },
+                .request_val => blk: {
+                    const rd = &self.pool[entry.slot_idx].data.recv_request;
+                    const conn = rd.conn orelse break :blk .{
+                        .@"type" = engine.Dart_CObject_kNull,
+                        .value = .{ .as_int64 = 0 },
+                    };
+
+                    method_bufs[i] = [_]u8{0} ** 17;
+                    const method_len = @min(rd.method_len, method_bufs[i].len - 1);
+                    @memcpy(method_bufs[i][0..method_len], conn.recv_buf[rd.method_off .. rd.method_off + method_len]);
+                    path_bufs[i] = [_]u8{0} ** 4097;
+                    const path_len = @min(rd.path_len, path_bufs[i].len - 1);
+                    @memcpy(path_bufs[i][0..path_len], conn.recv_buf[rd.path_off .. rd.path_off + path_len]);
+
+                    method_objs[i] = .{
+                        .@"type" = engine.Dart_CObject_kString,
+                        .value = .{ .as_string = method_bufs[i][0..method_len :0].ptr },
+                    };
+                    path_objs[i] = .{
+                        .@"type" = engine.Dart_CObject_kString,
+                        .value = .{ .as_string = path_bufs[i][0..path_len :0].ptr },
+                    };
+                    body_objs[i] = .{
+                        .@"type" = engine.Dart_CObject_kTypedData,
+                        .value = .{ .as_typed_data = .{
+                            .data_type = engine.Dart_TypedData_kUint8,
+                            .length = @intCast(rd.body_len),
+                            .values = conn.recv_buf[rd.body_off .. rd.body_off + rd.body_len].ptr,
+                        } },
+                    };
+                    keep_alive_objs[i] = .{
+                        .@"type" = engine.Dart_CObject_kBool,
+                        .value = .{ .as_bool = rd.keep_alive },
+                    };
+                    chunked_objs[i] = .{
+                        .@"type" = engine.Dart_CObject_kBool,
+                        .value = .{ .as_bool = rd.chunked },
+                    };
+                    request_values[i] = .{
+                        &method_objs[i],
+                        &path_objs[i],
+                        &body_objs[i],
+                        &keep_alive_objs[i],
+                        &chunked_objs[i],
+                    };
+                    request_objs[i] = .{
+                        .@"type" = engine.Dart_CObject_kArray,
+                        .value = .{ .as_array = .{
+                            .length = 5,
+                            .values = request_values[i][0..].ptr,
+                        } },
+                    };
+                    break :blk request_objs[i];
+                },
             };
             ptrs[2 * i] = &token_objs[i];
             ptrs[2 * i + 1] = &value_objs[i];
@@ -568,6 +768,9 @@ pub const EventLoop = struct {
 
         // Free all slots after posting — kTypedData bytes were copied synchronously.
         for (batch) |entry| {
+            if (entry.kind == .request_val) {
+                self.shiftRecvRequestAfterPost(entry.slot_idx);
+            }
             state.freeSlot(self.pool, &self.slot_alloc, entry.slot_idx);
         }
     }
@@ -591,6 +794,10 @@ pub const EventLoop = struct {
         bytes_len: usize,
     ) void {
         if (self.batch_port_id != 0) {
+            if (kind == .request_val) {
+                self.postSingleRequestCompletion(token, slot_idx);
+                return;
+            }
             // Batch mode: wrap as a 2-element kArray [token, value] so the
             // Dart _ZigIoDispatcher._onBatch handler can route it correctly.
             var token_obj = engine.Dart_CObject{
@@ -614,6 +821,7 @@ pub const EventLoop = struct {
                         .values = self.pool[slot_idx].data.recv.buf[0..bytes_len].ptr,
                     } },
                 },
+                .request_val => unreachable,
             };
             var ptrs = [2]?*engine.Dart_CObject{ &token_obj, &value_obj };
             var obj = engine.Dart_CObject{
@@ -642,6 +850,9 @@ pub const EventLoop = struct {
                     @intCast(bytes_len),
                     self.pool[slot_idx].data.recv.buf[0..bytes_len],
                 );
+            },
+            .request_val => {
+                self.postSingleRequestCompletion(token, slot_idx);
             },
         }
     }
@@ -702,6 +913,44 @@ pub const EventLoop = struct {
                 // message (one VM memcpy). Pool slot freed immediately — no GC.
                 state.postRecvResult(ctx.port_id, cqe.res, ctx.data.recv.buf[0..]);
                 state.freeSlot(self.pool, &self.slot_alloc, idx);
+            },
+            .recv_request => {
+                const rd = &ctx.data.recv_request;
+                const conn = rd.conn orelse {
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                };
+                if (cqe.res <= 0) {
+                    state.request_conn_table.remove(ctx.fd);
+                    state.postRecvResult(ctx.port_id, -1, conn.recv_buf[0..0]);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+                conn.recv_len += @intCast(cqe.res);
+                if (self.fillReadRequestMetadata(idx)) {
+                    self.postSingleRequestCompletion(ctx.port_id, idx);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+                const framed = http_parser.frameRequest(conn.recv_buf[0..conn.recv_len]);
+                if (framed.status == .invalid) {
+                    state.request_conn_table.remove(ctx.fd);
+                    state.postRecvResult(ctx.port_id, -1, conn.recv_buf[0..0]);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+                const space = conn.recv_buf[conn.recv_len..];
+                if (space.len == 0) {
+                    state.request_conn_table.remove(ctx.fd);
+                    state.postRecvResult(ctx.port_id, -1, conn.recv_buf[0..0]);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                    return;
+                }
+                _ = self.ring.recv(cqe.user_data, ctx.fd, .{ .buffer = space }, 0) catch {
+                    state.request_conn_table.remove(ctx.fd);
+                    state.postRecvResult(ctx.port_id, -1, conn.recv_buf[0..0]);
+                    state.freeSlot(self.pool, &self.slot_alloc, idx);
+                };
             },
             .recv_route => {
                 // Legacy path: parse+route in Zig, post int directly.
@@ -914,6 +1163,7 @@ pub const EventLoop = struct {
 const uring_ops = state.LoopOps{
     .submit_accept = submitAccept,
     .submit_recv = submitRecv,
+    .submit_recv_request = submitRecvRequest,
     .submit_recv_route = submitRecvRoute,
     .submit_serve = submitServe,
     .submit_loop = submitLoop,
@@ -937,6 +1187,48 @@ fn submitRecv(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
     const user_data: u64 = state.kPoolBase + @as(u64, slot_idx);
     // Kernel reads directly into the pool slot's embedded recv buffer — no alloc.
     _ = self.ring.read(user_data, fd, .{ .buffer = ctx.data.recv.buf[0..] }, 0) catch {
+        self.postSingleCompletion(ctx.port_id, slot_idx, .null_val, 0, 0);
+        state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
+    };
+}
+
+fn submitRecvRequest(loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void {
+    const self: *EventLoop = @ptrCast(@alignCast(loop));
+    const ctx = &self.pool[slot_idx];
+    const rd = &ctx.data.recv_request;
+    const conn = rd.conn orelse {
+        self.postSingleCompletion(ctx.port_id, slot_idx, .null_val, 0, 0);
+        state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
+        return;
+    };
+
+    if (conn.recv_len > 0 and self.fillReadRequestMetadata(slot_idx)) {
+        self.postSingleRequestCompletion(ctx.port_id, slot_idx);
+        state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
+        return;
+    }
+
+    const framed: http_parser.FramedRequest = if (conn.recv_len > 0)
+        http_parser.frameRequest(conn.recv_buf[0..conn.recv_len])
+    else
+        .{ .status = http_parser.ParseStatus.incomplete };
+    if (framed.status == .invalid) {
+        state.request_conn_table.remove(fd);
+        self.postSingleCompletion(ctx.port_id, slot_idx, .null_val, 0, 0);
+        state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
+        return;
+    }
+
+    const user_data: u64 = state.kPoolBase + @as(u64, slot_idx);
+    const space = conn.recv_buf[conn.recv_len..];
+    if (space.len == 0) {
+        state.request_conn_table.remove(fd);
+        self.postSingleCompletion(ctx.port_id, slot_idx, .null_val, 0, 0);
+        state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
+        return;
+    }
+    _ = self.ring.recv(user_data, fd, .{ .buffer = space }, 0) catch {
+        state.request_conn_table.remove(fd);
         self.postSingleCompletion(ctx.port_id, slot_idx, .null_val, 0, 0);
         state.freeSlot(self.pool, &self.slot_alloc, slot_idx);
     };

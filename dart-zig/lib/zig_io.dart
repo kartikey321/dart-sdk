@@ -70,6 +70,9 @@ external void _zigIoTcpAcceptToken(int listenFd, int token);
 @pragma('vm:external-name', 'ZigIo_TcpReadToken')
 external void _zigIoTcpReadToken(int connFd, int maxBytes, int token);
 
+@pragma('vm:external-name', 'ZigIo_TcpReadRequestToken')
+external void _zigIoTcpReadRequestToken(int connFd, int token);
+
 @pragma('vm:external-name', 'ZigIo_TcpServeToken')
 external void _zigIoTcpServeToken(int connFd, int token);
 
@@ -119,6 +122,22 @@ class _ZigIoDispatcher {
   }
 }
 
+class ZigIoFramedRequest {
+  final String method;
+  final String path;
+  final Uint8List bodyBytes;
+  final bool keepAlive;
+  final bool chunked;
+
+  const ZigIoFramedRequest(
+    this.method,
+    this.path,
+    this.bodyBytes,
+    this.keepAlive,
+    this.chunked,
+  );
+}
+
 /// Accept a connection. Returns connFd.
 Future<int> zigIoTcpAcceptFuture(int listenFd) =>
     _dispatcher.submit<int>((t) => _zigIoTcpAcceptToken(listenFd, t));
@@ -128,6 +147,21 @@ Future<Uint8List?> zigIoTcpReadFuture(int connFd, int maxBytes) =>
     _dispatcher
         .submit<Uint8List?>((t) => _zigIoTcpReadToken(connFd, maxBytes, t))
         .then((v) => v as Uint8List?);
+
+Future<ZigIoFramedRequest?> zigIoTcpReadRequestFuture(int connFd) =>
+    _dispatcher
+        .submit<Object?>((t) => _zigIoTcpReadRequestToken(connFd, t))
+        .then((v) {
+      if (v == null) return null;
+      final result = v as List<Object?>;
+      return ZigIoFramedRequest(
+        result[0]! as String,
+        result[1]! as String,
+        result[2]! as Uint8List,
+        result[3]! as bool,
+        result[4]! as bool,
+      );
+    });
 
 /// Fused read+route+write in one async op. Returns 0 (keep-alive) or -1 (close).
 /// One await per request — eliminates one isolate crossing vs read_route + write.

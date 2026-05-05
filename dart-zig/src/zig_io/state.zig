@@ -14,7 +14,56 @@ pub const kPoolBase: u64 = 16;
 /// 4096 slots × 8 KB = 32 MB total — stays resident in L3 cache.
 pub const kBufSize: usize = 8192;
 
-pub const Op = enum(u8) { accept, recv, recv_route, serve, loop, send, tls_handshake };
+pub const Op = enum(u8) { accept, recv, recv_request, recv_route, serve, loop, send, tls_handshake };
+
+pub const RequestConnState = struct {
+    fd: posix.fd_t = -1,
+    recv_buf: [kBufSize]u8 = undefined,
+    recv_len: usize = 0,
+};
+
+pub const RequestConnTable = struct {
+    entries: [kPoolSize]?*RequestConnState = [_]?*RequestConnState{null} ** kPoolSize,
+
+    pub fn getOrCreate(self: *RequestConnTable, fd: posix.fd_t) !*RequestConnState {
+        var free_idx: ?usize = null;
+        for (self.entries, 0..) |entry, idx| {
+            if (entry) |conn| {
+                if (conn.fd == fd) return conn;
+            } else if (free_idx == null) {
+                free_idx = idx;
+            }
+        }
+        const idx = free_idx orelse return error.OutOfMemory;
+        const conn = try std.heap.c_allocator.create(RequestConnState);
+        conn.* = .{ .fd = fd };
+        self.entries[idx] = conn;
+        return conn;
+    }
+
+    pub fn remove(self: *RequestConnTable, fd: posix.fd_t) void {
+        for (&self.entries) |*entry| {
+            if (entry.*) |conn| {
+                if (conn.fd == fd) {
+                    std.heap.c_allocator.destroy(conn);
+                    entry.* = null;
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn deinit(self: *RequestConnTable) void {
+        for (&self.entries) |*entry| {
+            if (entry.*) |conn| {
+                std.heap.c_allocator.destroy(conn);
+                entry.* = null;
+            }
+        }
+    }
+};
+
+pub threadlocal var request_conn_table: RequestConnTable = .{};
 
 pub const CompletionCtx = struct {
     in_use: bool = false,
@@ -31,6 +80,9 @@ pub const CompletionCtx = struct {
         /// Filled by the kernel (io_uring) or posix.read (kqueue).
         /// Immediately reusable after postRecvResult posts a kTypedData copy.
         recv: RecvData,
+        /// Read one complete HTTP request, keeping pipelined leftovers in
+        /// native per-connection state across submissions.
+        recv_request: RequestReadData,
         /// Like recv but parses + routes in Zig before posting.
         /// Posts a route int (RouteId) instead of a Uint8List — zero Dart heap alloc.
         recv_route: RecvData,
@@ -52,6 +104,18 @@ pub const CompletionCtx = struct {
 
     pub const RecvData = struct {
         buf: [kBufSize]u8 = undefined,
+    };
+    pub const RequestReadData = struct {
+        conn: ?*RequestConnState = null,
+        method_off: usize = 0,
+        method_len: usize = 0,
+        path_off: usize = 0,
+        path_len: usize = 0,
+        body_off: usize = 0,
+        body_len: usize = 0,
+        end_off: usize = 0,
+        keep_alive: bool = true,
+        chunked: bool = false,
     };
     pub const ServeData = struct {
         recv_buf: [kBufSize]u8 = undefined,
@@ -91,6 +155,7 @@ pub const CompletionCtx = struct {
 pub const LoopOps = struct {
     submit_accept: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
     submit_recv: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
+    submit_recv_request: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
     /// submit_recv_route reuses the same I/O path as submit_recv.
     /// The op field on the slot distinguishes how the completion is dispatched.
     submit_recv_route: *const fn (loop: *anyopaque, slot_idx: usize, fd: posix.fd_t) void,
