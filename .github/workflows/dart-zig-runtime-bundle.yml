@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build-bundle:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64]
 
     steps:
       - name: Checkout
@@ -61,7 +61,7 @@ jobs:
       - name: Build Dart engine prerequisites
         run: |
           python3 tools/build.py --mode=release --arch=x64 -j"$(nproc)" \
-            dartvm dart_engine_jit_shared dart_engine_aot_shared dart gen_snapshot
+            dartvm dart_engine_jit_shared dart_engine_aot_shared dart dartaotruntime gen_snapshot
 
       - name: Build BoringSSL static libraries
         run: |
@@ -110,5 +110,15 @@ jobs:
             -t "${IMAGE_NAME}:sha-${GITHUB_SHA}" \
             -t "${IMAGE_NAME}:latest" \
             .
+          docker run --rm "${IMAGE_NAME}:sha-${GITHUB_SHA}" \
+            /bin/sh -lc 'set -eu; \
+              for f in \
+                /opt/dart-zig-sdk/out/ReleaseX64/dart \
+                /opt/dart-zig-sdk/out/ReleaseX64/dartaotruntime \
+                /opt/dart-zig-sdk/out/ReleaseX64/gen_snapshot \
+                /opt/dart-zig-sdk/out/ReleaseX64/vm_platform.dill \
+                /opt/dart-zig-sdk/out/ReleaseX64/vm_platform_stripped.dill; do \
+                  test -f "$f"; \
+                done'
           docker push "${IMAGE_NAME}:sha-${GITHUB_SHA}"
           docker push "${IMAGE_NAME}:latest"
