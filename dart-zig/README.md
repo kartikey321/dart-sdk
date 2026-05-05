@@ -32,8 +32,9 @@ Latest major runtime milestone:
 
 Important caveats:
 
-- The fused `http_server.dart` fast path is the best-performing path today.
-- The higher-level `zig_http_server.dart` layer is more ergonomic, but slower.
+- The native fused `http_server.dart` fast path exists, but it does not route
+  per-request responses through Dart application code.
+- The comparable Dart-facing server API is `zig_http_server.dart`.
 - For current macOS backend risks and parity work, see
   `docs/dart-zig/macos-gap-review.md` and
   `docs/dart-zig/macos-parity.md`.
@@ -43,55 +44,29 @@ Important caveats:
 
 ### Recently validated measurements
 
-These were rerun on the current `dart-zig` branch on 2026-05-03.
+These were rerun on the current `dart-zig` branch on 2026-05-05.
 
 **Linux single-worker, `io_uring`, `wrk -t4 -c256 -d5s`:**
 ```
-Fused fast path (`lib/http_server.dart`, JIT):        201,160.98 req/s
-Fused fast path (`lib/http_server.dart`, AOT):        127,576.82 req/s
-`ZigHttpServer` (`lib/zig_http_server.dart`, JIT):     15,855.77 req/s
-`ZigHttpServer` (`lib/zig_http_server.dart`, AOT):     33,049.69 req/s
+`ZigHttpServer` (`lib/zig_http_server.dart`, JIT):     23,941.72 req/s  (3-run median)
+`ZigHttpServer` (`lib/zig_http_server.dart`, AOT):     28,850.44 req/s  (3-run median)
 ```
 
 Interpretation:
 
-- The fused Zig-side loop remains the performance path.
-- The Dart-layer `ZigHttpServer` abstraction is significantly slower, but it is
-  still useful as the higher-level API surface.
-- These numbers were measured on a single server worker, so they are not
-  multi-worker scaling claims.
-- The `ZigHttpServer` JIT run showed timeouts under this load shape, so its JIT
-  number should be treated as a current measurement, not a ceiling.
-
-**Linux pipelined HTTP/1.1, pinned 6-core host, `scripts/bench_pipeline.sh`:**
-```
-Client shape: 6 threads, 64 connections, pipeline depth 16, duration 10s
-
-dart-zig fused fast path (JIT)
-  1 worker: 102,857.99 req/s
-  3 workers: 109,398.62 req/s
-  6 workers: 106,589.13 req/s
-
-dart-zig fused fast path (AOT)
-  1 worker: 156,085.64 req/s
-  3 workers: 159,538.62 req/s
-  6 workers: 165,551.58 req/s
-
-dart:io multi-process baseline with SO_REUSEPORT shim (JIT)
-  1 process: 35,158.62 req/s
-  6 processes: 40,554.66 req/s
-```
-
-Pipeline interpretation:
-
-- The fused `dart-zig` fast path stays well ahead of the stock `dart:io`
-  baseline under HTTP/1.1 pipelining on this machine.
-- In this setup, fused AOT is the strongest pipeline mode.
-- The pinned 6-core pipeline run does not scale linearly with worker count,
-  which suggests the current client shape, pipeline depth, or core split is
-  becoming the limiter rather than pure server throughput.
-- Minor nonzero error counts appeared in a couple of runs near the benchmark
-  cutoff, so these are current validated numbers, not final peak claims.
+- These numbers measure the Dart-facing `ZigHttpServer` API, not the native
+  fused fast path.
+- Benchmark shape here is the empty-body `GET /` path from
+  `lib/zig_http_server_example.dart`.
+- They were measured on a single server worker, so they are not multi-worker
+  scaling claims.
+- `ZigHttpServer` AOT is currently modestly ahead of JIT on this benchmark
+  shape, but both still sit far below a fully native fused path.
+- For reference, the 3-run averages were:
+  - JIT: `23,437.98 req/s`
+  - AOT: `29,436.48 req/s`
+- Pipelined benchmarks for the fused native path are intentionally omitted
+  here because they are not comparable to Dart-level request/response handling.
 
 ### Historical milestone results
 
@@ -106,14 +81,16 @@ PERF-4 (serve op):  ~178k req/s      (1 await/request, 0 heap allocs)
 Phase 14 baseline:  ~159k req/s      (3 awaits/request, batch dispatcher)
 ```
 
-**Linux VPS 6-core (historical, io_uring, ReleaseFast, taskset CPU-pinned, `bench_vps.sh`):**
+**Linux VPS 6-core fused native path (historical, non-comparable to `ZigHttpServer`):**
 ```
-               JIT       AOT     vs PERF-4 JIT
-1 worker:    ~102k      97k          +7%
-3 workers:   ~200k     ~204k         ~flat
-6 workers:   ~210k     ~207k         +9%
+               JIT       AOT
+1 worker:    ~102k      97k
+3 workers:   ~200k     ~204k
+6 workers:   ~210k     ~207k
 ```
-> JIT 1w beats PERF-4 (95k) after JIT safepoint fix (`jit_idle_iters` threshold=128 in io_uring.zig).
+These figures are kept only as runtime history for the fused native server
+path. They should not be compared directly with `ZigHttpServer`, because that
+API routes request handling through Dart.
 
 ---
 
