@@ -141,6 +141,7 @@ pub const EventLoop = struct {
         // involvement). Used to give the JIT compiler periodic safepoints so its
         // background threads can install compiled code on single-core-pinned VMs.
         var jit_idle_iters: u32 = 0;
+        var no_live_idle_iters: u8 = 0;
         while (true) {
             _ = self.ring.submit_and_wait(1) catch break;
 
@@ -196,6 +197,18 @@ pub const EventLoop = struct {
                             self.notify_needs_rearm = true;
                         };
                     } else if (cqe.user_data == signal_user_data) {
+                        if (cqe.res <= 0) {
+                            // Spurious/non-ready signalfd completion (e.g. -EAGAIN).
+                            // Re-arm and continue; this is not a real shutdown signal.
+                            self.armSignalRead() catch return;
+                            continue;
+                        }
+                        const sig_bytes = std.mem.asBytes(&self.signal_buf);
+                        const signo = std.mem.readInt(u32, sig_bytes[0..4], .little);
+                        if (signo != @as(u32, @intCast(posix.SIG.INT)) and signo != @as(u32, @intCast(posix.SIG.TERM))) {
+                            self.armSignalRead() catch return;
+                            continue;
+                        }
                         // SIGINT or SIGTERM — graceful shutdown.
                         // Flush any pending batch so in-flight completions are delivered
                         // before the event loop exits (prevents hanging Dart futures).
@@ -207,16 +220,34 @@ pub const EventLoop = struct {
                         // Only hint GC when truly idle — no pool I/O in this batch.
                         // Calling Dart_NotifyIdle mid-benchmark triggers premature GC.
                         if (!any_io) {
+                            // In batch-dispatch mode (ZigIo_SetBatchPort set), this
+                            // runtime is serving native I/O futures and should not
+                            // auto-exit on Dart_HasLivePorts heuristics.
+                            if (self.batch_port_id != 0) {
+                                self.armTimeout() catch return;
+                                continue;
+                            }
                             if (self.isolate != null) {
                                 engine.DartEngine_AcquireIsolate(self.isolate);
                                 engine.Dart_NotifyIdle(std.time.microTimestamp() + 5_000);
                                 const live = engine.Dart_HasLivePorts();
                                 engine.DartEngine_ReleaseIsolate();
                                 if (!live) {
-                                    if (batch_n > 0) self.flushBatch(batch[0..batch_n]);
-                                    return;
+                                    // Avoid exiting on transient false negatives from
+                                    // Dart_HasLivePorts while server I/O is still active.
+                                    // Require repeated idle "no-live" checks and an empty
+                                    // completion pool before terminating the loop.
+                                    no_live_idle_iters +%= 1;
+                                    if (no_live_idle_iters >= 5 and !hasActivePoolOps(self)) {
+                                        if (batch_n > 0) self.flushBatch(batch[0..batch_n]);
+                                        return;
+                                    }
+                                } else {
+                                    no_live_idle_iters = 0;
                                 }
                             }
+                        } else {
+                            no_live_idle_iters = 0;
                         }
                         self.armTimeout() catch return;
                     } else if (cqe.user_data >= state.kPoolBase) {
@@ -255,6 +286,13 @@ pub const EventLoop = struct {
                 }
             }
         }
+    }
+
+    fn hasActivePoolOps(self: *EventLoop) bool {
+        for (self.pool) |ctx| {
+            if (ctx.in_use) return true;
+        }
+        return false;
     }
 
     // -------------------------------------------------------------------------
@@ -296,7 +334,6 @@ pub const EventLoop = struct {
         rd.body_off = framed.body_offset;
         rd.end_off = framed.end_offset;
         rd.keep_alive = framed.keep_alive;
-        rd.chunked = framed.chunked;
         if (framed.chunked) {
             const decoded_len = http_parser.decodeChunkedBodyInPlace(&conn.recv_buf, framed.body_offset, framed.end_offset) orelse return false;
             rd.body_len = decoded_len;
@@ -310,14 +347,22 @@ pub const EventLoop = struct {
         const rd = &self.pool[slot_idx].data.recv_request;
         const conn = rd.conn orelse return;
 
-        var method_buf: [17]u8 = [_]u8{0} ** 17;
-        const method_len = @min(rd.method_len, method_buf.len - 1);
-        @memcpy(method_buf[0..method_len], conn.recv_buf[rd.method_off .. rd.method_off + method_len]);
-
-        var path_buf: [4097]u8 = [_]u8{0} ** 4097;
-        const path_len = @min(rd.path_len, path_buf.len - 1);
-        @memcpy(path_buf[0..path_len], conn.recv_buf[rd.path_off .. rd.path_off + path_len]);
-
+        var method_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kTypedData,
+            .value = .{ .as_typed_data = .{
+                .data_type = engine.Dart_TypedData_kUint8,
+                .length = @intCast(rd.method_len),
+                .values = conn.recv_buf[rd.method_off .. rd.method_off + rd.method_len].ptr,
+            } },
+        };
+        var path_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kTypedData,
+            .value = .{ .as_typed_data = .{
+                .data_type = engine.Dart_TypedData_kUint8,
+                .length = @intCast(rd.path_len),
+                .values = conn.recv_buf[rd.path_off .. rd.path_off + rd.path_len].ptr,
+            } },
+        };
         var body_obj = engine.Dart_CObject{
             .@"type" = engine.Dart_CObject_kTypedData,
             .value = .{ .as_typed_data = .{
@@ -326,33 +371,20 @@ pub const EventLoop = struct {
                 .values = conn.recv_buf[rd.body_off .. rd.body_off + rd.body_len].ptr,
             } },
         };
-        var method_obj = engine.Dart_CObject{
-            .@"type" = engine.Dart_CObject_kString,
-            .value = .{ .as_string = method_buf[0..method_len :0].ptr },
+        var flags_obj = engine.Dart_CObject{
+            .@"type" = engine.Dart_CObject_kInt64,
+            .value = .{ .as_int64 = if (rd.keep_alive) 1 else 0 },
         };
-        var path_obj = engine.Dart_CObject{
-            .@"type" = engine.Dart_CObject_kString,
-            .value = .{ .as_string = path_buf[0..path_len :0].ptr },
-        };
-        var keep_alive_obj = engine.Dart_CObject{
-            .@"type" = engine.Dart_CObject_kBool,
-            .value = .{ .as_bool = rd.keep_alive },
-        };
-        var chunked_obj = engine.Dart_CObject{
-            .@"type" = engine.Dart_CObject_kBool,
-            .value = .{ .as_bool = rd.chunked },
-        };
-        var request_values = [5]?*engine.Dart_CObject{
+        var request_values = [4]?*engine.Dart_CObject{
             &method_obj,
             &path_obj,
             &body_obj,
-            &keep_alive_obj,
-            &chunked_obj,
+            &flags_obj,
         };
         var request_obj = engine.Dart_CObject{
             .@"type" = engine.Dart_CObject_kArray,
             .value = .{ .as_array = .{
-                .length = 5,
+                .length = 4,
                 .values = request_values[0..].ptr,
             } },
         };
@@ -669,11 +701,8 @@ pub const EventLoop = struct {
         var method_objs: [32]engine.Dart_CObject = undefined;
         var path_objs: [32]engine.Dart_CObject = undefined;
         var body_objs: [32]engine.Dart_CObject = undefined;
-        var keep_alive_objs: [32]engine.Dart_CObject = undefined;
-        var chunked_objs: [32]engine.Dart_CObject = undefined;
-        var request_values: [32][5]?*engine.Dart_CObject = undefined;
-        var method_bufs: [32][17]u8 = undefined;
-        var path_bufs: [32][4097]u8 = undefined;
+        var flags_objs: [32]engine.Dart_CObject = undefined;
+        var request_values: [32][4]?*engine.Dart_CObject = undefined;
 
         for (batch, 0..) |entry, i| {
             token_objs[i] = .{
@@ -704,20 +733,21 @@ pub const EventLoop = struct {
                         .value = .{ .as_int64 = 0 },
                     };
 
-                    method_bufs[i] = [_]u8{0} ** 17;
-                    const method_len = @min(rd.method_len, method_bufs[i].len - 1);
-                    @memcpy(method_bufs[i][0..method_len], conn.recv_buf[rd.method_off .. rd.method_off + method_len]);
-                    path_bufs[i] = [_]u8{0} ** 4097;
-                    const path_len = @min(rd.path_len, path_bufs[i].len - 1);
-                    @memcpy(path_bufs[i][0..path_len], conn.recv_buf[rd.path_off .. rd.path_off + path_len]);
-
                     method_objs[i] = .{
-                        .@"type" = engine.Dart_CObject_kString,
-                        .value = .{ .as_string = method_bufs[i][0..method_len :0].ptr },
+                        .@"type" = engine.Dart_CObject_kTypedData,
+                        .value = .{ .as_typed_data = .{
+                            .data_type = engine.Dart_TypedData_kUint8,
+                            .length = @intCast(rd.method_len),
+                            .values = conn.recv_buf[rd.method_off .. rd.method_off + rd.method_len].ptr,
+                        } },
                     };
                     path_objs[i] = .{
-                        .@"type" = engine.Dart_CObject_kString,
-                        .value = .{ .as_string = path_bufs[i][0..path_len :0].ptr },
+                        .@"type" = engine.Dart_CObject_kTypedData,
+                        .value = .{ .as_typed_data = .{
+                            .data_type = engine.Dart_TypedData_kUint8,
+                            .length = @intCast(rd.path_len),
+                            .values = conn.recv_buf[rd.path_off .. rd.path_off + rd.path_len].ptr,
+                        } },
                     };
                     body_objs[i] = .{
                         .@"type" = engine.Dart_CObject_kTypedData,
@@ -727,25 +757,20 @@ pub const EventLoop = struct {
                             .values = conn.recv_buf[rd.body_off .. rd.body_off + rd.body_len].ptr,
                         } },
                     };
-                    keep_alive_objs[i] = .{
-                        .@"type" = engine.Dart_CObject_kBool,
-                        .value = .{ .as_bool = rd.keep_alive },
-                    };
-                    chunked_objs[i] = .{
-                        .@"type" = engine.Dart_CObject_kBool,
-                        .value = .{ .as_bool = rd.chunked },
+                    flags_objs[i] = .{
+                        .@"type" = engine.Dart_CObject_kInt64,
+                        .value = .{ .as_int64 = if (rd.keep_alive) 1 else 0 },
                     };
                     request_values[i] = .{
                         &method_objs[i],
                         &path_objs[i],
                         &body_objs[i],
-                        &keep_alive_objs[i],
-                        &chunked_objs[i],
+                        &flags_objs[i],
                     };
                     request_objs[i] = .{
                         .@"type" = engine.Dart_CObject_kArray,
                         .value = .{ .as_array = .{
-                            .length = 5,
+                            .length = 4,
                             .values = request_values[i][0..].ptr,
                         } },
                     };
