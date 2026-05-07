@@ -53,7 +53,18 @@ jobs:
 
       - name: Install Zig 0.15.2
         run: |
-          curl -fL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o /tmp/zig.tar.xz
+          set -euo pipefail
+          ZIG_URL="https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz"
+          # Network to ziglang.org can be very slow/flaky on some runners.
+          # Use resume + aggressive retries instead of a single-shot download.
+          rm -f /tmp/zig.tar.xz
+          curl -fL "$ZIG_URL" -o /tmp/zig.tar.xz \
+            --retry 20 \
+            --retry-all-errors \
+            --retry-delay 3 \
+            --connect-timeout 20 \
+            --max-time 3600 \
+            --continue-at -
           sudo tar -xf /tmp/zig.tar.xz -C /opt/
           sudo ln -sf /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
           zig version
