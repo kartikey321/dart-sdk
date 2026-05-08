@@ -5,6 +5,7 @@
 // ignore_for_file: camel_case_types
 
 import 'dart:async' show Completer;
+import 'dart:convert' show utf8;
 import 'dart:isolate' show RawReceivePort, SendPort;
 import 'dart:typed_data' show Uint8List;
 
@@ -123,18 +124,16 @@ class _ZigIoDispatcher {
 }
 
 class ZigIoFramedRequest {
-  final String method;
-  final String path;
+  final Uint8List methodBytes;
+  final Uint8List pathBytes;
   final Uint8List bodyBytes;
   final bool keepAlive;
-  final bool chunked;
 
   const ZigIoFramedRequest(
-    this.method,
-    this.path,
+    this.methodBytes,
+    this.pathBytes,
     this.bodyBytes,
     this.keepAlive,
-    this.chunked,
   );
 }
 
@@ -154,14 +153,27 @@ Future<ZigIoFramedRequest?> zigIoTcpReadRequestFuture(int connFd) =>
         .then((v) {
       if (v == null) return null;
       final result = v as List<Object?>;
+      final flagsObj = result[3];
+      final flags = switch (flagsObj) {
+        int i => i,
+        bool b => b ? 1 : 0,
+        _ => 0,
+      };
       return ZigIoFramedRequest(
-        result[0]! as String,
-        result[1]! as String,
-        result[2]! as Uint8List,
-        result[3]! as bool,
-        result[4]! as bool,
+        _asBytes(result[0]),
+        _asBytes(result[1]),
+        _asBytes(result[2]),
+        (flags & 1) != 0,
       );
     });
+
+Uint8List _asBytes(Object? v) {
+  if (v == null) return Uint8List(0);
+  if (v is Uint8List) return v;
+  if (v is List<int>) return Uint8List.fromList(v);
+  if (v is String) return Uint8List.fromList(utf8.encode(v));
+  throw StateError('Unexpected request field type: ${v.runtimeType}');
+}
 
 /// Fused read+route+write in one async op. Returns 0 (keep-alive) or -1 (close).
 /// One await per request — eliminates one isolate crossing vs read_route + write.
