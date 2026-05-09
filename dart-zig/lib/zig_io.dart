@@ -5,7 +5,7 @@
 // ignore_for_file: camel_case_types
 
 import 'dart:async' show Completer;
-import 'dart:convert' show utf8;
+import 'dart:convert' show ascii, utf8;
 import 'dart:isolate' show RawReceivePort, SendPort;
 import 'dart:typed_data' show Uint8List;
 
@@ -135,6 +135,10 @@ class ZigIoFramedRequest {
     this.bodyBytes,
     this.keepAlive,
   );
+
+  // Backward compatibility for older call sites.
+  String get method => ascii.decode(methodBytes);
+  String get path => ascii.decode(pathBytes);
 }
 
 /// Accept a connection. Returns connFd.
